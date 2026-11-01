@@ -9,6 +9,9 @@
 #include <zephyr/device.h>
 #include <stdbool.h>
 
+/* The listener stores signed 16-bit fractional remainders. */
+#define ZMK_INPUT_PROCESSOR_RUNTIME_MAX_SCALE_DIVISOR 32768U
+
 /**
  * @brief Axis snap mode
  */
@@ -87,7 +90,8 @@ int zmk_input_processor_runtime_set_scaling(const struct device *dev, uint32_t m
  * @param dev Pointer to the device structure
  * @param degrees Rotation angle in degrees
  * @param mode Where to store the value (persist to flash, memory-only, or temporary)
- * @return 0 on success, negative error code on failure
+ * @return 0 on success; -ENOTSUP for a nonzero angle without a configured
+ * virtual rotation source, or another negative error code on failure
  */
 int zmk_input_processor_runtime_set_rotation(const struct device *dev, int32_t degrees,
                                              enum zmk_input_processor_runtime_write_mode mode);
@@ -164,7 +168,7 @@ const struct device *zmk_input_processor_runtime_find_by_name(const char *name);
  * @param id ID of the processor to find
  * @return Pointer to the device structure, or NULL if not found
  */
-const struct device *zmk_input_processor_runtime_find_by_id(uint8_t id);
+const struct device *zmk_input_processor_runtime_find_by_id(uint32_t id);
 
 /**
  * @brief Get the ID of a runtime input processor
@@ -196,7 +200,7 @@ int zmk_input_processor_runtime_foreach(int (*callback)(const struct device *dev
  * @return 0 on success, negative error code on failure
  */
 int zmk_input_processor_runtime_set_temp_layer(const struct device *dev, bool enabled,
-                                               uint8_t layer, uint32_t activation_delay_ms,
+                                               uint32_t layer, uint32_t activation_delay_ms,
                                                uint32_t deactivation_delay_ms,
                                                enum zmk_input_processor_runtime_write_mode mode);
 
@@ -220,7 +224,7 @@ int zmk_input_processor_runtime_set_temp_layer_enabled(
  * @return 0 on success, negative error code on failure
  */
 int zmk_input_processor_runtime_set_temp_layer_layer(
-    const struct device *dev, uint8_t layer, enum zmk_input_processor_runtime_write_mode mode);
+    const struct device *dev, uint32_t layer, enum zmk_input_processor_runtime_write_mode mode);
 
 /**
  * @brief Set temp-layer activation delay
@@ -274,7 +278,8 @@ void zmk_input_processor_runtime_temp_layer_keep_active(const struct device *dev
  * @return 0 on success, negative error code on failure
  */
 int zmk_input_processor_runtime_set_axis_snap_mode(
-    const struct device *dev, uint8_t mode, enum zmk_input_processor_runtime_write_mode write_mode);
+    const struct device *dev, uint32_t mode,
+    enum zmk_input_processor_runtime_write_mode write_mode);
 
 /**
  * @brief Set axis snap threshold
@@ -285,7 +290,7 @@ int zmk_input_processor_runtime_set_axis_snap_mode(
  * @return 0 on success, negative error code on failure
  */
 int zmk_input_processor_runtime_set_axis_snap_threshold(
-    const struct device *dev, uint16_t threshold, enum zmk_input_processor_runtime_write_mode mode);
+    const struct device *dev, uint32_t threshold, enum zmk_input_processor_runtime_write_mode mode);
 
 /**
  * @brief Set axis snap timeout
@@ -296,7 +301,7 @@ int zmk_input_processor_runtime_set_axis_snap_threshold(
  * @return 0 on success, negative error code on failure
  */
 int zmk_input_processor_runtime_set_axis_snap_timeout(
-    const struct device *dev, uint16_t timeout_ms,
+    const struct device *dev, uint32_t timeout_ms,
     enum zmk_input_processor_runtime_write_mode mode);
 
 /**
@@ -310,7 +315,7 @@ int zmk_input_processor_runtime_set_axis_snap_timeout(
  * @return 0 on success, negative error code on failure
  */
 int zmk_input_processor_runtime_set_axis_snap(
-    const struct device *dev, uint8_t mode, uint16_t threshold, uint16_t timeout_ms,
+    const struct device *dev, uint32_t mode, uint32_t threshold, uint32_t timeout_ms,
     enum zmk_input_processor_runtime_write_mode write_mode);
 
 /**
@@ -369,8 +374,7 @@ int zmk_input_processor_runtime_set_y_invert(const struct device *dev, bool inve
  * @return 0 on success, negative error code on failure
  */
 int zmk_input_processor_runtime_set_inertia_window(
-    const struct device *dev, uint16_t window_ms,
-    enum zmk_input_processor_runtime_write_mode mode);
+    const struct device *dev, uint16_t window_ms, enum zmk_input_processor_runtime_write_mode mode);
 
 /**
  * @brief Set inertia output interval.
@@ -398,23 +402,19 @@ int zmk_input_processor_runtime_set_inertia_interval(
  * @return 0 on success, negative error code on failure
  */
 int zmk_input_processor_runtime_set_inertia_threshold(
-    const struct device *dev, uint16_t threshold,
-    enum zmk_input_processor_runtime_write_mode mode);
+    const struct device *dev, uint32_t threshold, enum zmk_input_processor_runtime_write_mode mode);
 
 /** Enable or disable inertia independently of its trigger threshold. */
 int zmk_input_processor_runtime_set_inertia_enabled(
-    const struct device *dev, bool enabled,
-    enum zmk_input_processor_runtime_write_mode mode);
+    const struct device *dev, bool enabled, enum zmk_input_processor_runtime_write_mode mode);
 
 /** Set the second-stage post-scale input threshold (zero disables it). */
 int zmk_input_processor_runtime_set_inertia_fast_threshold(
-    const struct device *dev, uint16_t threshold,
-    enum zmk_input_processor_runtime_write_mode mode);
+    const struct device *dev, uint32_t threshold, enum zmk_input_processor_runtime_write_mode mode);
 
 /** Set the second-stage synthetic output percentage (100-1000). */
 int zmk_input_processor_runtime_set_inertia_fast_output_percent(
-    const struct device *dev, uint16_t percent,
-    enum zmk_input_processor_runtime_write_mode mode);
+    const struct device *dev, uint16_t percent, enum zmk_input_processor_runtime_write_mode mode);
 
 /**
  * @brief Set inertia decay per output interval.
@@ -428,9 +428,8 @@ int zmk_input_processor_runtime_set_inertia_fast_output_percent(
  * @param mode Where to store the value (persist to flash, memory-only, or temporary)
  * @return 0 on success, negative error code on failure
  */
-int zmk_input_processor_runtime_set_inertia_decay(
-    const struct device *dev, uint8_t decay_percent,
-    enum zmk_input_processor_runtime_write_mode mode);
+int zmk_input_processor_runtime_set_inertia_decay(const struct device *dev, uint8_t decay_percent,
+                                                  enum zmk_input_processor_runtime_write_mode mode);
 
 /** Set the normal-stage synthetic output limit (zero is unlimited). */
 int zmk_input_processor_runtime_set_inertia_normal_max_output(
@@ -482,6 +481,5 @@ int zmk_input_processor_runtime_test_inertia_tick_at(const struct device *dev, i
 bool zmk_input_processor_runtime_test_inertia_active(const struct device *dev);
 
 /** @brief Test-only: return the final input-event code inertia will emit. */
-int zmk_input_processor_runtime_test_inertia_output_code(const struct device *dev,
-                                                             uint16_t *code);
+int zmk_input_processor_runtime_test_inertia_output_code(const struct device *dev, uint16_t *code);
 #endif

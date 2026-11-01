@@ -176,6 +176,7 @@ export function InputProcessorManager() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isUpdating, setIsUpdating] = useState(false);
+  const formDirtyRef = useRef(false);
 
   // Layer information
   const [layers, setLayers] = useState<Array<{ index: number; name: string }>>(
@@ -316,6 +317,7 @@ export function InputProcessorManager() {
   );
 
   const loadProcessors = useCallback(async () => {
+    formDirtyRef.current = false;
     setIsLoading(true);
     setError(null);
 
@@ -785,6 +787,7 @@ export function InputProcessorManager() {
         }
       }
 
+      formDirtyRef.current = false;
       // Updates will come via notifications
     } catch (err) {
       if (isUnlockRequiredError(err)) {
@@ -873,6 +876,7 @@ export function InputProcessorManager() {
     (id: number) => {
       const proc = processors.find((p) => p.id === id);
       if (proc) {
+        formDirtyRef.current = false;
         setSelectedProcessorId(id);
         setScaleMultiplier(proc.scaleMultiplier);
         setScaleDivisor(proc.scaleDivisor);
@@ -970,7 +974,16 @@ export function InputProcessorManager() {
 
             // If this is the currently selected processor, update form values
             // Skip updates if we're currently updating to prevent overwriting user changes
-            if (selectedProcessorId === proc.id && !isUpdating) {
+            if (selectedProcessorId === proc.id) {
+              setInertiaNotificationsEnabled(proc.inertiaNotificationsEnabled);
+              setInertiaActive(proc.inertiaActive);
+              if (!proc.inertiaActive) setInertiaFastInput(false);
+            }
+            if (
+              selectedProcessorId === proc.id &&
+              !isUpdating &&
+              !formDirtyRef.current
+            ) {
               setScaleMultiplier(proc.scaleMultiplier);
               setScaleDivisor(proc.scaleDivisor);
               setRotationDegrees(proc.rotationDegrees);
@@ -1180,7 +1193,12 @@ export function InputProcessorManager() {
       </section>
 
       {selectedProcessorId !== null && (
-        <section className="card">
+        <section
+          className="card"
+          onChangeCapture={() => {
+            formDirtyRef.current = true;
+          }}
+        >
           <h2>
             Configure:{" "}
             {processors.find((p) => p.id === selectedProcessorId)?.name}
@@ -1205,6 +1223,7 @@ export function InputProcessorManager() {
               id="scale-divisor"
               type="number"
               min="1"
+              max="32768"
               value={scaleDivisor}
               onChange={(e) => setScaleDivisor(parseInt(e.target.value) || 1)}
             />

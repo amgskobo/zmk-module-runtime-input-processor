@@ -4,6 +4,7 @@
 * SPDX-License-Identifier: MIT
 */
 #include "my_awesome_keyboard-layouts.dtsi"
+#include <behaviors/mouse_move.dtsi>
 
 #include <dt-bindings/zmk/pointing.h>
 #include <zephyr/dt-bindings/input/input-event-codes.h>
@@ -57,4 +58,16 @@
 
 		#input-processor-cells = <0>;
 	};
+};
+
+/ {
+    board_rotation: board_rotation {
+        compatible = "zmk,runtime-input-rotation";
+        device = <&mmv>;
+        processor = <&mouse_input_processor>;
+    };
+};
+&mmv_input_listener {
+    device = <&board_rotation>;
+    input-processors = <&mouse_input_processor>;
 };

@@ -14,6 +14,8 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/dlist.h>
+#include <zephyr/sys/atomic.h>
+#include <zmk/pointing/input_rotation.h>
 
 #if IS_ENABLED(CONFIG_ZMK_CUSTOM_SETTINGS)
 #include <cormoran/zmk/custom_settings.h>
@@ -98,11 +100,16 @@ struct inertia_trigger_state {
 #define INERTIA_REVERSE_EXIT_MIN CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_INERTIA_REVERSE_EXIT_MIN
 #define INERTIA_REVERSE_EXIT_MAX CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_INERTIA_REVERSE_EXIT_MAX
 #define INERTIA_SPEED_FRACTION_BITS 16
+#define RUNTIME_REMAINDER_SOURCES MAX(1, DT_NUM_INST_STATUS_OKAY(zmk_input_listener))
 
 struct runtime_processor_data {
     const struct device *dev;
 #if IS_ENABLED(CONFIG_ZMK_CUSTOM_SETTINGS)
     struct k_work_delayable save_work;
+    struct k_mutex save_lock;
+    uint8_t pending_save[CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE];
+    size_t pending_save_size;
+    bool pending_save_valid;
 #endif
     // Current active values (may be temporary from behavior)
     uint32_t scale_multiplier;
@@ -114,15 +121,11 @@ struct runtime_processor_data {
     uint32_t persistent_scale_divisor;
     int32_t persistent_rotation_degrees;
 
-    // Precomputed rotation values
-    int32_t cos_val; // cos * 1000
-    int32_t sin_val; // sin * 1000
-
-    // Last seen X/Y values for rotation
-    int16_t last_x;
-    int16_t last_y;
-    bool has_x;
-    bool has_y;
+    /* Bias-packed sine/cosine are published as one atomic snapshot. */
+    atomic_t rotation_trig;
+    atomic_t settings_generation;
+    uint32_t remainder_generations[RUNTIME_REMAINDER_SOURCES][4];
+    bool rotation_source_warned;
 
     // Temp-layer layer settings
     bool temp_layer_enabled;
@@ -151,7 +154,7 @@ struct runtime_processor_data {
     uint16_t persistent_axis_snap_timeout_ms;
 
     // Axis snap runtime state
-    int16_t axis_snap_cross_axis_accum;     // Accumulated movement on cross axis
+    int32_t axis_snap_cross_axis_accum;     // Accumulated movement on cross axis
     int64_t axis_snap_last_decay_timestamp; // Last time accumulator was decayed
 
     // Code mapping settings
@@ -213,25 +216,23 @@ struct runtime_processor_data {
     struct k_work_delayable temp_layer_activation_work;
     struct k_work_delayable temp_layer_deactivation_work;
     bool temp_layer_layer_active;
-    bool temp_layer_keep_active; // Set by behavior to prevent deactivation
+    uint8_t temp_layer_active_layer; // Layer actually held, independent of the configured target
+    bool temp_layer_keep_active;     // Set by behavior to prevent deactivation
+    bool temp_layer_activation_pending;
+    int64_t temp_layer_activation_started_at;
     int64_t last_input_timestamp;
     int64_t last_keypress_timestamp;
 };
 
 static void update_rotation_values(struct runtime_processor_data *data) {
-    if (data->rotation_degrees == 0) {
-        data->cos_val = 1000;
-        data->sin_val = 0;
-        return;
-    }
-
-    // Convert degrees to radians and compute sin/cos
-    double angle_rad = (double)data->rotation_degrees * 3.14159265359 / 180.0;
-    data->cos_val = (int32_t)(cos(angle_rad) * 1000.0);
-    data->sin_val = (int32_t)(sin(angle_rad) * 1000.0);
-
-    LOG_DBG("Rotation %d degrees: cos=%d, sin=%d", data->rotation_degrees, data->cos_val,
-            data->sin_val);
+    const double angle_rad =
+        (double)(data->rotation_degrees % 360) * 3.14159265358979323846 / 180.0;
+    const int32_t cosine = (int32_t)lround(cos(angle_rad) * 1000.0);
+    const int32_t sine = (int32_t)lround(sin(angle_rad) * 1000.0);
+    /* Each biased component fits eleven bits; the packed value is positive
+     * on every supported atomic ABI and cannot expose a mixed angle. */
+    atomic_set(&data->rotation_trig, (cosine + 1000) | ((sine + 1000) << 11));
+    atomic_inc(&data->settings_generation);
 }
 
 // Temp-layer layer work handlers
@@ -240,7 +241,22 @@ static void temp_layer_activation_work_handler(struct k_work *work) {
     struct runtime_processor_data *data =
         CONTAINER_OF(dwork, struct runtime_processor_data, temp_layer_activation_work);
 
-    if (!data->temp_layer_enabled || data->temp_layer_layer_active) {
+    if (!data->temp_layer_enabled || data->temp_layer_layer_active ||
+        !data->temp_layer_activation_pending) {
+        return;
+    }
+
+    int64_t now = k_uptime_get();
+    int64_t elapsed = now - data->temp_layer_activation_started_at;
+    if (elapsed < data->temp_layer_activation_delay_ms) {
+        k_work_reschedule(dwork, K_MSEC(data->temp_layer_activation_delay_ms - elapsed));
+        return;
+    }
+    data->temp_layer_activation_pending = false;
+    if ((data->last_keypress_timestamp != 0 &&
+         data->last_keypress_timestamp >= data->temp_layer_activation_started_at) ||
+        (data->temp_layer_deactivation_delay_ms > 0 &&
+         now - data->last_input_timestamp >= data->temp_layer_deactivation_delay_ms)) {
         return;
     }
 
@@ -248,6 +264,12 @@ static void temp_layer_activation_work_handler(struct k_work *work) {
     int ret = zmk_keymap_layer_activate(data->temp_layer_layer, false);
     if (ret == 0) {
         data->temp_layer_layer_active = true;
+        data->temp_layer_active_layer = data->temp_layer_layer;
+        if (!data->temp_layer_keep_active) {
+            int64_t remaining =
+                MAX(0, data->temp_layer_deactivation_delay_ms - (now - data->last_input_timestamp));
+            k_work_reschedule(&data->temp_layer_deactivation_work, K_MSEC(remaining));
+        }
         LOG_INF("Temp-layer layer %d activated", data->temp_layer_layer);
     } else {
         LOG_ERR("Failed to activate temp-layer layer %d: %d", data->temp_layer_layer, ret);
@@ -264,7 +286,7 @@ static void temp_layer_deactivation_work_handler(struct k_work *work) {
     }
 
     // Deactivate the temp-layer layer
-    int ret = zmk_keymap_layer_deactivate(data->temp_layer_layer, false);
+    int ret = zmk_keymap_layer_deactivate(data->temp_layer_active_layer, false);
     if (ret == 0) {
         data->temp_layer_layer_active = false;
         LOG_INF("Temp-layer layer %d deactivated", data->temp_layer_layer);
@@ -312,25 +334,29 @@ static bool is_processor_active_for_current_layers(uint32_t active_layers_mask) 
 
 static int scale_val(struct input_event *event, uint32_t mul, uint32_t div,
                      struct zmk_input_processor_state *state) {
+    if (div > ZMK_INPUT_PROCESSOR_RUNTIME_MAX_SCALE_DIVISOR) {
+        return -EINVAL;
+    }
     if (mul == 0 || div == 0) {
         return ZMK_INPUT_PROC_CONTINUE;
     }
 
-    int16_t value_mul = event->value * (int16_t)mul;
+    int64_t value_mul = (int64_t)event->value * mul;
 
     if (state && state->remainder) {
         value_mul += *state->remainder;
     }
 
-    int16_t scaled = value_mul / (int16_t)div;
+    int64_t scaled = value_mul / div;
 
     if (state && state->remainder) {
-        *state->remainder = value_mul - (scaled * (int16_t)div);
+        *state->remainder = value_mul % div;
     }
 
-    LOG_DBG("scaled %d with %d/%d to %d", event->value, mul, div, scaled);
+    scaled = scaled > INT16_MAX ? INT16_MAX : scaled < INT16_MIN ? INT16_MIN : scaled;
+    LOG_DBG("scaled %d with %u/%u to %d", event->value, mul, div, (int)scaled);
 
-    event->value = scaled;
+    event->value = (int16_t)scaled;
     return 0;
 }
 
@@ -364,13 +390,12 @@ static void inertia_stop(struct runtime_processor_data *data,
     inertia_clear_windows(data);
     k_work_cancel_delayable(&data->inertia_work);
     if (was_active && data->inertia_notifications_enabled) {
+        raise_zmk_input_processor_inertia_state_changed((
+            struct zmk_input_processor_inertia_state_changed){
+            .dev = data->dev, .state = ZMK_INPUT_PROCESSOR_INERTIA_STOPPED, .stop_reason = reason});
         raise_zmk_input_processor_inertia_state_changed(
-            (struct zmk_input_processor_inertia_state_changed){.dev = data->dev,
-                                                               .state = ZMK_INPUT_PROCESSOR_INERTIA_STOPPED,
-                                                               .stop_reason = reason});
-        raise_zmk_input_processor_inertia_state_changed(
-            (struct zmk_input_processor_inertia_state_changed){.dev = data->dev,
-                                                               .state = ZMK_INPUT_PROCESSOR_INERTIA_FAST_INPUT_STOPPED});
+            (struct zmk_input_processor_inertia_state_changed){
+                .dev = data->dev, .state = ZMK_INPUT_PROCESSOR_INERTIA_FAST_INPUT_STOPPED});
     }
 }
 
@@ -378,8 +403,8 @@ static uint32_t inertia_bucket_ms(uint32_t window_ms) {
     return (window_ms + INERTIA_WINDOW_SLICES - 1) / INERTIA_WINDOW_SLICES;
 }
 
-static void inertia_add_report(struct inertia_trigger_state *track, uint32_t amount,
-                               int64_t now, uint32_t window_ms) {
+static void inertia_add_report(struct inertia_trigger_state *track, uint32_t amount, int64_t now,
+                               uint32_t window_ms) {
     uint32_t bucket_ms = inertia_bucket_ms(window_ms);
     int64_t start = track->has_report ? track->last_report_ms : now;
     if (start > now) {
@@ -408,16 +433,16 @@ static void inertia_add_report(struct inertia_trigger_state *track, uint32_t amo
             track->bucket_number[slot] = number;
             track->bucket_q16[slot] = 0;
         }
-        track->bucket_q16[slot] += ((uint64_t)amount << INERTIA_SPEED_FRACTION_BITS) *
-                                   (end - cursor) / duration;
+        track->bucket_q16[slot] +=
+            ((uint64_t)amount << INERTIA_SPEED_FRACTION_BITS) * (end - cursor) / duration;
         cursor = end;
     }
     track->last_report_ms = now;
     track->has_report = true;
 }
 
-static uint64_t inertia_window_total_q16(const struct inertia_trigger_state *track,
-                                         int64_t now, uint32_t window_ms) {
+static uint64_t inertia_window_total_q16(const struct inertia_trigger_state *track, int64_t now,
+                                         uint32_t window_ms) {
     uint32_t bucket_ms = inertia_bucket_ms(window_ms);
     int64_t start = now - window_ms;
     uint64_t total = 0;
@@ -440,9 +465,9 @@ static uint32_t inertia_raw_threshold(const struct runtime_processor_data *data)
     if (data->scale_multiplier == 0 || data->scale_divisor == 0) {
         return data->inertia_threshold;
     }
-    uint64_t raw = ((uint64_t)data->inertia_threshold * data->scale_divisor +
-                    data->scale_multiplier - 1) /
-                   data->scale_multiplier;
+    uint64_t raw =
+        ((uint64_t)data->inertia_threshold * data->scale_divisor + data->scale_multiplier - 1) /
+        data->scale_multiplier;
     return MIN(raw, UINT32_MAX);
 }
 
@@ -469,8 +494,7 @@ int zmk_input_processor_runtime_test_inertia_sliding_window(void) {
 /* Finish one output interval. Speed and the rolling window use input before
  * scaling; apply scale only when producing synthetic output. */
 static int16_t inertia_finish_interval(struct runtime_processor_data *data, int64_t now) {
-    if (!data->inertia_active || data->inertia_window_ms == 0 ||
-        data->inertia_interval_ms == 0) {
+    if (!data->inertia_active || data->inertia_window_ms == 0 || data->inertia_interval_ms == 0) {
         return 0;
     }
     if (!is_processor_active_for_current_layers(data->active_layers)) {
@@ -478,8 +502,7 @@ static int16_t inertia_finish_interval(struct runtime_processor_data *data, int6
         return 0;
     }
 
-    uint64_t denominator = (uint64_t)data->inertia_window_ms <<
-                           INERTIA_SPEED_FRACTION_BITS;
+    uint64_t denominator = (uint64_t)data->inertia_window_ms << INERTIA_SPEED_FRACTION_BITS;
     /* Physical reports already pass through to the endpoint. Estimate their
      * current rate from the latest bucket, rather than the whole window, so
      * inertia can take over promptly when physical motion slows or stops.
@@ -492,9 +515,8 @@ static int16_t inertia_finish_interval(struct runtime_processor_data *data, int6
         size_t slot = bucket_number % INERTIA_BUCKETS;
         /* Distributed reports end just before last_report_ms; at an exact
          * boundary their latest populated bucket is the preceding one. */
-        if (bucket_number > 0 &&
-            (measurement->bucket_number[slot] != bucket_number ||
-             measurement->bucket_q16[slot] == 0)) {
+        if (bucket_number > 0 && (measurement->bucket_number[slot] != bucket_number ||
+                                  measurement->bucket_q16[slot] == 0)) {
             bucket_number--;
             slot = bucket_number % INERTIA_BUCKETS;
         }
@@ -506,22 +528,20 @@ static int16_t inertia_finish_interval(struct runtime_processor_data *data, int6
      * physical + inertia = retained peak * fast percentage. */
     uint64_t target_q16 = data->inertia_speed_q16;
     if (data->inertia_fast_active) {
-        uint64_t fast_numerator = target_q16 * data->inertia_fast_output_percent +
-                                  data->inertia_fast_remainder;
+        uint64_t fast_numerator =
+            target_q16 * data->inertia_fast_output_percent + data->inertia_fast_remainder;
         target_q16 = fast_numerator / 100U;
         data->inertia_fast_remainder = fast_numerator % 100U;
     }
     uint64_t supplemental_q16 = target_q16 > physical_q16 ? target_q16 - physical_q16 : 0;
-    uint64_t numerator = supplemental_q16 * data->inertia_interval_ms +
-                         data->inertia_output_remainder;
+    uint64_t numerator =
+        supplemental_q16 * data->inertia_interval_ms + data->inertia_output_remainder;
     uint64_t raw_amount = numerator / denominator;
     data->inertia_output_remainder = numerator % denominator;
-    uint32_t multiplier = data->scale_multiplier > 0 && data->scale_divisor > 0
-                              ? data->scale_multiplier
-                              : 1;
-    uint32_t divisor = data->scale_multiplier > 0 && data->scale_divisor > 0
-                           ? data->scale_divisor
-                           : 1;
+    uint32_t multiplier =
+        data->scale_multiplier > 0 && data->scale_divisor > 0 ? data->scale_multiplier : 1;
+    uint32_t divisor =
+        data->scale_multiplier > 0 && data->scale_divisor > 0 ? data->scale_divisor : 1;
     uint64_t scaled_numerator = raw_amount * multiplier + data->inertia_scale_remainder;
     uint64_t scaled_amount = scaled_numerator / divisor;
     data->inertia_scale_remainder = scaled_numerator % divisor;
@@ -532,8 +552,7 @@ static int16_t inertia_finish_interval(struct runtime_processor_data *data, int6
     if (scaled_amount > INT16_MAX) {
         scaled_amount = INT16_MAX;
     }
-    int16_t output =
-        data->inertia_direction < 0 ? -(int16_t)scaled_amount : (int16_t)scaled_amount;
+    int16_t output = data->inertia_direction < 0 ? -(int16_t)scaled_amount : (int16_t)scaled_amount;
 
     /* Repeated multiplication by the retained fraction gives exponential
      * decay. Skip the interval that received input so its full speed is used. */
@@ -551,9 +570,10 @@ static int16_t inertia_finish_interval(struct runtime_processor_data *data, int6
         uint64_t raw_needed =
             ((uint64_t)divisor - data->inertia_scale_remainder + multiplier - 1) / multiplier;
         uint64_t missing_q16 = raw_needed * denominator - data->inertia_output_remainder;
-        uint32_t output_percent = data->inertia_fast_active ? data->inertia_fast_output_percent : 100U;
-        uint64_t future_numerator = data->inertia_speed_q16 * data->inertia_interval_ms *
-                                    output_percent;
+        uint32_t output_percent =
+            data->inertia_fast_active ? data->inertia_fast_output_percent : 100U;
+        uint64_t future_numerator =
+            data->inertia_speed_q16 * data->inertia_interval_ms * output_percent;
         if (missing_q16 > UINT64_MAX / data->inertia_decay_percent ||
             future_numerator < missing_q16 * data->inertia_decay_percent) {
             inertia_stop(data, ZMK_INPUT_PROCESSOR_INERTIA_STOP_REASON_SETTLED);
@@ -697,8 +717,8 @@ static void inertia_work_handler(struct k_work *work) {
     struct runtime_processor_data *data =
         CONTAINER_OF(dwork, struct runtime_processor_data, inertia_work);
 
-    if (!data->inertia_active || !data->inertia_enabled ||
-        data->inertia_window_ms == 0 || data->inertia_interval_ms == 0) {
+    if (!data->inertia_active || !data->inertia_enabled || data->inertia_window_ms == 0 ||
+        data->inertia_interval_ms == 0) {
         return;
     }
 
@@ -715,24 +735,24 @@ static void inertia_work_handler(struct k_work *work) {
 
 static void inertia_start(struct runtime_processor_data *data, uint8_t axis, int8_t direction,
                           uint16_t output_code, int64_t now) {
-    uint64_t initial_amount_q16 = inertia_window_total_q16(
-        &data->inertia_trigger[axis], now, data->inertia_window_ms);
+    uint64_t initial_amount_q16 =
+        inertia_window_total_q16(&data->inertia_trigger[axis], now, data->inertia_window_ms);
     data->inertia_measurement = data->inertia_trigger[axis];
     data->inertia_scaled_measurement = data->inertia_scaled_trigger[axis];
-    data->inertia_fast_active = data->inertia_fast_threshold > 0 &&
-        inertia_window_total_q16(&data->inertia_scaled_measurement, now,
-                                 data->inertia_window_ms) >=
+    data->inertia_fast_active =
+        data->inertia_fast_threshold > 0 &&
+        inertia_window_total_q16(&data->inertia_scaled_measurement, now, data->inertia_window_ms) >=
             (uint64_t)data->inertia_fast_threshold << INERTIA_SPEED_FRACTION_BITS;
     data->inertia_active = true;
     if (data->inertia_notifications_enabled) {
         raise_zmk_input_processor_inertia_state_changed(
             (struct zmk_input_processor_inertia_state_changed){
                 .dev = data->dev, .state = ZMK_INPUT_PROCESSOR_INERTIA_STARTED});
-        raise_zmk_input_processor_inertia_state_changed(
-            (struct zmk_input_processor_inertia_state_changed){.dev = data->dev,
-                                                               .state = data->inertia_fast_active
-                                                                           ? ZMK_INPUT_PROCESSOR_INERTIA_FAST_INPUT_STARTED
-                                                                           : ZMK_INPUT_PROCESSOR_INERTIA_FAST_INPUT_STOPPED});
+        raise_zmk_input_processor_inertia_state_changed((
+            struct zmk_input_processor_inertia_state_changed){
+            .dev = data->dev,
+            .state = data->inertia_fast_active ? ZMK_INPUT_PROCESSOR_INERTIA_FAST_INPUT_STARTED
+                                               : ZMK_INPUT_PROCESSOR_INERTIA_FAST_INPUT_STOPPED});
     }
     data->inertia_axis = axis;
     data->inertia_direction = direction;
@@ -747,16 +767,14 @@ static void inertia_start(struct runtime_processor_data *data, uint8_t axis, int
     data->inertia_reverse_amount = 0;
     data->inertia_reverse_start = 0;
     k_work_reschedule(&data->inertia_work, K_MSEC(data->inertia_interval_ms));
-    LOG_DBG("Inertia started: axis=%u direction=%d threshold=%u window=%u interval=%u",
-            axis, direction, data->inertia_threshold, data->inertia_window_ms,
-            data->inertia_interval_ms);
+    LOG_DBG("Inertia started: axis=%u direction=%d threshold=%u window=%u interval=%u", axis,
+            direction, data->inertia_threshold, data->inertia_window_ms, data->inertia_interval_ms);
 }
 
 static void inertia_handle_physical_event(struct runtime_processor_data *data, uint8_t axis,
                                           const struct input_event *event, int16_t raw_value) {
     if (!IS_ENABLED(CONFIG_ZMK_POINTING) || event->type != INPUT_EV_REL || raw_value == 0 ||
-        !data->inertia_enabled ||
-        data->inertia_window_ms == 0 || data->inertia_interval_ms == 0) {
+        !data->inertia_enabled || data->inertia_window_ms == 0 || data->inertia_interval_ms == 0) {
         return;
     }
 
@@ -777,8 +795,7 @@ static void inertia_handle_physical_event(struct runtime_processor_data *data, u
             data->inertia_reverse_amount =
                 saturating_add_amount(data->inertia_reverse_amount, magnitude);
             uint32_t reverse_threshold = CLAMP(inertia_raw_threshold(data) / 2,
-                                               INERTIA_REVERSE_EXIT_MIN,
-                                               INERTIA_REVERSE_EXIT_MAX);
+                                               INERTIA_REVERSE_EXIT_MIN, INERTIA_REVERSE_EXIT_MAX);
             if (data->inertia_reverse_amount >= reverse_threshold) {
                 LOG_DBG("Inertia stopped by reverse input %d", raw_value);
                 inertia_stop(data, ZMK_INPUT_PROCESSOR_INERTIA_STOP_REASON_REVERSE_INPUT);
@@ -794,18 +811,16 @@ static void inertia_handle_physical_event(struct runtime_processor_data *data, u
         inertia_add_report(measurement, magnitude, now, data->inertia_window_ms);
         if (event->value != 0 && (event->value < 0 ? -1 : 1) == direction) {
             inertia_add_report(&data->inertia_scaled_measurement,
-                               input_value_magnitude(event->value), now,
-                               data->inertia_window_ms);
+                               input_value_magnitude(event->value), now, data->inertia_window_ms);
             if (!data->inertia_fast_active && data->inertia_fast_threshold > 0 &&
                 inertia_window_total_q16(&data->inertia_scaled_measurement, now,
                                          data->inertia_window_ms) >=
                     (uint64_t)data->inertia_fast_threshold << INERTIA_SPEED_FRACTION_BITS) {
                 data->inertia_fast_active = true;
                 if (data->inertia_notifications_enabled) {
-                    raise_zmk_input_processor_inertia_state_changed(
-                        (struct zmk_input_processor_inertia_state_changed){
-                            .dev = data->dev,
-                            .state = ZMK_INPUT_PROCESSOR_INERTIA_FAST_INPUT_STARTED});
+                    raise_zmk_input_processor_inertia_state_changed((
+                        struct zmk_input_processor_inertia_state_changed){
+                        .dev = data->dev, .state = ZMK_INPUT_PROCESSOR_INERTIA_FAST_INPUT_STARTED});
                 }
             }
         }
@@ -839,6 +854,93 @@ static void inertia_handle_physical_event(struct runtime_processor_data *data, u
     }
 }
 
+static int16_t rotation_component(int64_t value, int32_t *remainder) {
+    const int64_t whole = value / 1000;
+    if (whole > INT16_MAX || whole < INT16_MIN) {
+        *remainder = 0;
+        return whole > 0 ? INT16_MAX : INT16_MIN;
+    }
+    *remainder = (int32_t)(value % 1000);
+    return (int16_t)whole;
+}
+
+bool zmk_input_processor_runtime_rotation_codes(const struct device *processor, uint16_t *x_code,
+                                                uint16_t *y_code) {
+    const struct runtime_processor_config *cfg = processor->config;
+    if (cfg->type != INPUT_EV_REL || cfg->x_codes_len != 1 || cfg->y_codes_len != 1 ||
+        cfg->x_codes[0] == cfg->y_codes[0]) {
+        return false;
+    }
+    *x_code = cfg->x_codes[0];
+    *y_code = cfg->y_codes[0];
+    return true;
+}
+
+int zmk_input_processor_runtime_rotate_xy(const struct device *processor, int32_t x, int32_t y,
+                                          struct zmk_runtime_rotation_state *state,
+                                          int16_t *rotated_x, int16_t *rotated_y) {
+    if (!processor || !state || !rotated_x || !rotated_y) {
+        return -EINVAL;
+    }
+    struct runtime_processor_data *data = processor->data;
+    uint32_t generation = zmk_input_processor_runtime_settings_generation(processor);
+    const uint32_t trig = is_processor_active_for_current_layers(data->active_layers)
+                              ? (uint32_t)atomic_get(&data->rotation_trig)
+                              : (2000U | (1000U << 11));
+    if (!state->initialized || state->trig != trig || state->settings_generation != generation) {
+        *state = (struct zmk_runtime_rotation_state){
+            .trig = trig, .settings_generation = generation, .initialized = true};
+    }
+    const int32_t cosine = (int32_t)(trig & 2047U) - 1000;
+    const int32_t sine = (int32_t)((trig >> 11) & 2047U) - 1000;
+    *rotated_x = rotation_component((int64_t)x * cosine - (int64_t)y * sine + state->x_remainder,
+                                    &state->x_remainder);
+    *rotated_y = rotation_component((int64_t)x * sine + (int64_t)y * cosine + state->y_remainder,
+                                    &state->y_remainder);
+    return 0;
+}
+
+uint32_t zmk_input_processor_runtime_settings_generation(const struct device *processor) {
+    struct runtime_processor_data *data = processor->data;
+    return (uint32_t)atomic_get(&data->settings_generation);
+}
+
+static void retire_inline_remainder(const struct device *dev, const struct input_event *event,
+                                    struct zmk_input_processor_state *state) {
+    if (!state || !state->remainder || zmk_runtime_input_pipeline_matches(dev, event->dev)) {
+        return;
+    }
+    struct runtime_processor_data *data = dev->data;
+    unsigned int axis;
+    switch (event->code) {
+    case INPUT_REL_X:
+        axis = 0;
+        break;
+    case INPUT_REL_Y:
+        axis = 1;
+        break;
+    case INPUT_REL_HWHEEL:
+        axis = 2;
+        break;
+    case INPUT_REL_WHEEL:
+        axis = 3;
+        break;
+    default:
+        *state->remainder = 0;
+        return;
+    }
+    if (state->input_device_index >= ARRAY_SIZE(data->remainder_generations)) {
+        *state->remainder = 0;
+        return;
+    }
+    uint32_t generation = zmk_input_processor_runtime_settings_generation(dev);
+    uint32_t *seen = &data->remainder_generations[state->input_device_index][axis];
+    if (*seen != generation) {
+        *state->remainder = 0;
+        *seen = generation;
+    }
+}
+
 static int runtime_processor_handle_event(const struct device *dev, struct input_event *event,
                                           uint32_t param1, uint32_t param2,
                                           struct zmk_input_processor_state *state) {
@@ -862,6 +964,16 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
             inertia_stop(data, ZMK_INPUT_PROCESSOR_INERTIA_STOP_REASON_LAYER_INACTIVE);
         }
         return ZMK_INPUT_PROC_CONTINUE;
+    }
+
+    retire_inline_remainder(dev, event, state);
+
+    /* An inline processor can return only one event. Rotation is expanded
+     * by the module's virtual source before this listener pipeline runs. */
+    if (data->rotation_degrees != 0 && !zmk_runtime_input_rotation_matches(dev, event->dev) &&
+        !data->rotation_source_warned) {
+        LOG_WRN("Rotation requires a virtual input source; inline input stays unrotated");
+        data->rotation_source_warned = true;
     }
 
     bool is_x = (x_idx >= 0);
@@ -897,47 +1009,14 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
         data->last_input_timestamp = now;
 
         // Check if we should activate the layer
-        if (!data->temp_layer_layer_active) {
+        if (!data->temp_layer_layer_active && !data->temp_layer_activation_pending) {
             // Only activate if no key press within activation delay window
             if (data->last_keypress_timestamp == 0 ||
                 (now - data->last_keypress_timestamp) >= data->temp_layer_activation_delay_ms) {
-                // Schedule activation
-                k_work_reschedule(&data->temp_layer_activation_work, K_NO_WAIT);
-            }
-        }
-    }
-
-    // Apply rotation
-    if (data->rotation_degrees != 0) {
-        if (is_x) {
-            data->last_x = value;
-            data->has_x = true;
-
-            // If we have both X and Y, apply rotation
-            if (data->has_y) {
-                // X' = X * cos - Y * sin
-                // Using 1000 as scaling factor for fixed-point arithmetic
-                // (precision: 0.001)
-                int32_t rotated_x =
-                    (data->last_x * data->cos_val - data->last_y * data->sin_val) / 1000;
-                event->value = (int16_t)rotated_x;
-                data->has_y = false;
-            } else {
-                event->value = 0;
-            }
-        } else {
-            data->last_y = value;
-            data->has_y = true;
-
-            // If we have both X and Y, apply rotation
-            if (data->has_x) {
-                // Y' = X * sin + Y * cos
-                int32_t rotated_y =
-                    (data->last_x * data->sin_val + data->last_y * data->cos_val) / 1000;
-                event->value = (int16_t)rotated_y;
-                data->has_x = false;
-            } else {
-                event->value = 0;
+                data->temp_layer_activation_pending = true;
+                data->temp_layer_activation_started_at = now;
+                k_work_reschedule(&data->temp_layer_activation_work,
+                                  K_MSEC(data->temp_layer_activation_delay_ms));
             }
         }
     }
@@ -964,13 +1043,21 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
                 // Decay every 50ms
                 int64_t decay_periods = elapsed / 50;
                 if (decay_periods > 0) {
-                    int16_t decay_per_50ms =
-                        data->axis_snap_threshold / (data->axis_snap_timeout_ms / 50);
+                    int32_t decay_per_50ms =
+                        (uint32_t)data->axis_snap_threshold * 50U / data->axis_snap_timeout_ms;
                     if (decay_per_50ms < 1) {
                         decay_per_50ms = 1; // Minimum decay of 1
                     }
 
-                    int16_t total_decay = decay_per_50ms * decay_periods;
+                    int32_t magnitude = data->axis_snap_cross_axis_accum < 0
+                                            ? -data->axis_snap_cross_axis_accum
+                                            : data->axis_snap_cross_axis_accum;
+                    // Clamp before multiplying: an arbitrarily long idle period
+                    // must not overflow or push the accumulator past zero.
+                    int32_t total_decay =
+                        decay_periods >= (magnitude + decay_per_50ms - 1) / decay_per_50ms
+                            ? magnitude
+                            : (int32_t)decay_periods * decay_per_50ms;
 
                     // Decay towards zero
                     if (data->axis_snap_cross_axis_accum > 0) {
@@ -992,10 +1079,8 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
             }
         }
 
-        bool should_unlock = false;
-
         if (is_cross_axis) {
-            int16_t current_abs_accum = data->axis_snap_cross_axis_accum < 0
+            int32_t current_abs_accum = data->axis_snap_cross_axis_accum < 0
                                             ? -data->axis_snap_cross_axis_accum
                                             : data->axis_snap_cross_axis_accum;
             bool is_unsnapped = current_abs_accum >= data->axis_snap_threshold;
@@ -1011,7 +1096,7 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
             data->axis_snap_last_decay_timestamp = now;
 
             // Check if threshold exceeded (check absolute value)
-            int16_t abs_accum = data->axis_snap_cross_axis_accum < 0
+            int32_t abs_accum = data->axis_snap_cross_axis_accum < 0
                                     ? -data->axis_snap_cross_axis_accum
                                     : data->axis_snap_cross_axis_accum;
 
@@ -1157,32 +1242,36 @@ BUILD_ASSERT(RIP_SETTINGS_BLOB_SIZE <= CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE
  * from the struct memcpy so no wrapper-struct padding enters the layout. */
 static size_t pack_processor_settings(const struct runtime_processor_data *data, uint8_t *buf) {
     struct rip_persist_v3 settings = {
-        .v2 = {
-            .v1 = {
-                .scale_multiplier = data->persistent_scale_multiplier,
-                .scale_divisor = data->persistent_scale_divisor,
-                .rotation_degrees = data->persistent_rotation_degrees,
-                .temp_layer_enabled = data->persistent_temp_layer_enabled,
-                .temp_layer_layer = data->persistent_temp_layer_layer,
-                .temp_layer_activation_delay_ms = data->persistent_temp_layer_activation_delay_ms,
-                .temp_layer_deactivation_delay_ms = data->persistent_temp_layer_deactivation_delay_ms,
-                .active_layers = data->persistent_active_layers,
-                .axis_snap_mode = data->persistent_axis_snap_mode,
-                .axis_snap_threshold = data->persistent_axis_snap_threshold,
-                .axis_snap_timeout_ms = data->persistent_axis_snap_timeout_ms,
-                .xy_to_scroll_enabled = data->persistent_xy_to_scroll_enabled,
-                .xy_swap_enabled = data->persistent_xy_swap_enabled,
-                .x_invert = data->persistent_x_invert,
-                .y_invert = data->persistent_y_invert,
+        .v2 =
+            {
+                .v1 =
+                    {
+                        .scale_multiplier = data->persistent_scale_multiplier,
+                        .scale_divisor = data->persistent_scale_divisor,
+                        .rotation_degrees = data->persistent_rotation_degrees,
+                        .temp_layer_enabled = data->persistent_temp_layer_enabled,
+                        .temp_layer_layer = data->persistent_temp_layer_layer,
+                        .temp_layer_activation_delay_ms =
+                            data->persistent_temp_layer_activation_delay_ms,
+                        .temp_layer_deactivation_delay_ms =
+                            data->persistent_temp_layer_deactivation_delay_ms,
+                        .active_layers = data->persistent_active_layers,
+                        .axis_snap_mode = data->persistent_axis_snap_mode,
+                        .axis_snap_threshold = data->persistent_axis_snap_threshold,
+                        .axis_snap_timeout_ms = data->persistent_axis_snap_timeout_ms,
+                        .xy_to_scroll_enabled = data->persistent_xy_to_scroll_enabled,
+                        .xy_swap_enabled = data->persistent_xy_swap_enabled,
+                        .x_invert = data->persistent_x_invert,
+                        .y_invert = data->persistent_y_invert,
+                    },
+                .inertia_enabled = data->persistent_inertia_enabled,
+                .inertia_window_ms = data->persistent_inertia_window_ms,
+                .inertia_interval_ms = data->persistent_inertia_interval_ms,
+                .inertia_threshold = data->persistent_inertia_threshold,
+                .inertia_decay_percent = data->persistent_inertia_decay_percent,
+                .inertia_fast_threshold = data->persistent_inertia_fast_threshold,
+                .inertia_fast_output_percent = data->persistent_inertia_fast_output_percent,
             },
-            .inertia_enabled = data->persistent_inertia_enabled,
-            .inertia_window_ms = data->persistent_inertia_window_ms,
-            .inertia_interval_ms = data->persistent_inertia_interval_ms,
-            .inertia_threshold = data->persistent_inertia_threshold,
-            .inertia_decay_percent = data->persistent_inertia_decay_percent,
-            .inertia_fast_threshold = data->persistent_inertia_fast_threshold,
-            .inertia_fast_output_percent = data->persistent_inertia_fast_output_percent,
-        },
         .inertia_normal_max_output = data->persistent_inertia_normal_max_output,
     };
     buf[0] = RIP_SETTINGS_BLOB_VERSION;
@@ -1225,6 +1314,9 @@ static int unpack_and_apply_processor_settings(struct runtime_processor_data *da
     }
 
     const struct rip_persist_v1 *v1 = &settings.v1;
+    if (v1->scale_divisor > ZMK_INPUT_PROCESSOR_RUNTIME_MAX_SCALE_DIVISOR) {
+        return -EINVAL;
+    }
     data->persistent_scale_multiplier = data->scale_multiplier = v1->scale_multiplier;
     data->persistent_scale_divisor = data->scale_divisor = v1->scale_divisor;
     data->persistent_rotation_degrees = data->rotation_degrees = v1->rotation_degrees;
@@ -1255,6 +1347,8 @@ static int unpack_and_apply_processor_settings(struct runtime_processor_data *da
     data->persistent_inertia_normal_max_output = data->inertia_normal_max_output =
         normal_max_output;
     inertia_stop(data, ZMK_INPUT_PROCESSOR_INERTIA_STOP_REASON_SETTINGS_CHANGED);
+    data->temp_layer_activation_pending = false;
+    k_work_cancel_delayable(&data->temp_layer_activation_work);
     update_rotation_values(data);
     return 0;
 }
@@ -1291,14 +1385,13 @@ int zmk_input_processor_runtime_test_apply_legacy_v2(const struct device *dev) {
 }
 #endif
 
-/* Pack the processor's current baseline and flush it to flash immediately. */
-static int save_processor_settings_now(const struct device *dev) {
-    struct runtime_processor_data *data = dev->data;
+/* The worker writes the baseline captured by the PERSIST operation. Later
+ * MEMORY edits must not become durable merely because a debounce is pending. */
+static int persist_processor_snapshot(const struct device *dev, const uint8_t *bytes, size_t size) {
     const struct runtime_processor_config *cfg = dev->config;
-
-    struct zmk_custom_setting_value value = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_BYTES};
-    value.size = pack_processor_settings(data, value.bytes_value);
-
+    struct zmk_custom_setting_value value = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_BYTES,
+                                             .size = size};
+    memcpy(value.bytes_value, bytes, size);
     int ret = zmk_custom_setting_write_by_key(RIP_SETTINGS_SUBSYSTEM_ID, cfg->name, &value,
                                               ZMK_CUSTOM_SETTING_WRITE_MODE_PERSIST);
     if (ret < 0) {
@@ -1309,16 +1402,40 @@ static int save_processor_settings_now(const struct device *dev) {
     return ret;
 }
 
+static int save_processor_settings_now(const struct device *dev) {
+    struct runtime_processor_data *data = dev->data;
+    k_mutex_lock(&data->save_lock, K_FOREVER);
+    k_work_cancel_delayable(&data->save_work);
+    data->pending_save_valid = false;
+    data->pending_save_size = pack_processor_settings(data, data->pending_save);
+    int ret = persist_processor_snapshot(dev, data->pending_save, data->pending_save_size);
+    k_mutex_unlock(&data->save_lock);
+    return ret;
+}
+
 static void save_processor_settings_work_handler(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     struct runtime_processor_data *data =
         CONTAINER_OF(dwork, struct runtime_processor_data, save_work);
-    save_processor_settings_now(data->dev);
+    k_mutex_lock(&data->save_lock, K_FOREVER);
+    if (data->pending_save_valid) {
+        data->pending_save_valid = false;
+        persist_processor_snapshot(data->dev, data->pending_save, data->pending_save_size);
+    }
+    k_mutex_unlock(&data->save_lock);
 }
 
 static int schedule_save_processor_settings(const struct device *dev) {
     struct runtime_processor_data *data = dev->data;
-    return k_work_reschedule(&data->save_work, K_MSEC(CONFIG_ZMK_SETTINGS_SAVE_DEBOUNCE));
+    k_mutex_lock(&data->save_lock, K_FOREVER);
+    data->pending_save_size = pack_processor_settings(data, data->pending_save);
+    data->pending_save_valid = true;
+    int ret = k_work_reschedule(&data->save_work, K_MSEC(CONFIG_ZMK_SETTINGS_SAVE_DEBOUNCE));
+    if (ret < 0) {
+        data->pending_save_valid = false;
+    }
+    k_mutex_unlock(&data->save_lock);
+    return ret;
 }
 
 #if IS_ENABLED(CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_TEST)
@@ -1346,12 +1463,6 @@ static int runtime_processor_init(const struct device *dev) {
     data->persistent_scale_multiplier = cfg->initial_scale_multiplier;
     data->persistent_scale_divisor = cfg->initial_scale_divisor;
     data->persistent_rotation_degrees = cfg->initial_rotation_degrees;
-
-    // Initialize rotation state
-    data->has_x = false;
-    data->has_y = false;
-    data->last_x = 0;
-    data->last_y = 0;
 
     // Initialize temp-layer settings from DT defaults
     data->temp_layer_enabled = cfg->initial_temp_layer_enabled;
@@ -1419,6 +1530,7 @@ static int runtime_processor_init(const struct device *dev) {
 
     data->dev = dev;
 #if IS_ENABLED(CONFIG_ZMK_CUSTOM_SETTINGS)
+    k_mutex_init(&data->save_lock);
     k_work_init_delayable(&data->save_work, save_processor_settings_work_handler);
 #endif
     // Initialize temp-layer work queues
@@ -1455,7 +1567,7 @@ static void raise_state_changed_event(const struct device *dev) {
     }
 
     raise_zmk_input_processor_state_changed((struct zmk_input_processor_state_changed){
-        .id = (uint8_t)id, .name = name, .config = config});
+        .id = (uint32_t)id, .name = name, .config = config});
 }
 
 // Human-readable suffix for the setter LOG lines (leading space + parens so the
@@ -1483,15 +1595,17 @@ static const char *write_mode_label(enum zmk_input_processor_runtime_write_mode 
  */
 static int commit_write(const struct device *dev,
                         enum zmk_input_processor_runtime_write_mode mode) {
+    atomic_inc(&((struct runtime_processor_data *)dev->data)->settings_generation);
 #if IS_ENABLED(CONFIG_ZMK_CUSTOM_SETTINGS)
     if (mode == ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY) {
         return 0;
     }
+    /* Snapshot before notifying listeners, which may perform another edit. */
+    int ret = mode == ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_PERSIST
+                  ? schedule_save_processor_settings(dev)
+                  : 0;
     raise_state_changed_event(dev);
-    if (mode == ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_PERSIST) {
-        return schedule_save_processor_settings(dev);
-    }
-    return 0;
+    return ret;
 #else
     ARG_UNUSED(dev);
     ARG_UNUSED(mode);
@@ -1527,7 +1641,7 @@ static void load_processor_defaults(const struct device *dev) {
 
     // Deactivate temp-layer layer if active
     if (data->temp_layer_layer_active) {
-        zmk_keymap_layer_deactivate(data->temp_layer_layer, false);
+        zmk_keymap_layer_deactivate(data->temp_layer_active_layer, false);
         data->temp_layer_layer_active = false;
     }
 
@@ -1569,6 +1683,8 @@ static void load_processor_defaults(const struct device *dev) {
     data->persistent_inertia_fast_output_percent = data->inertia_fast_output_percent;
     inertia_stop(data, ZMK_INPUT_PROCESSOR_INERTIA_STOP_REASON_SETTINGS_CHANGED);
 
+    data->temp_layer_activation_pending = false;
+    k_work_cancel_delayable(&data->temp_layer_activation_work);
     update_rotation_values(data);
 }
 
@@ -1576,7 +1692,7 @@ static void load_processor_defaults(const struct device *dev) {
 int zmk_input_processor_runtime_set_scaling(const struct device *dev, uint32_t multiplier,
                                             uint32_t divisor,
                                             enum zmk_input_processor_runtime_write_mode mode) {
-    if (!dev) {
+    if (!dev || divisor > ZMK_INPUT_PROCESSOR_RUNTIME_MAX_SCALE_DIVISOR) {
         return -EINVAL;
     }
 
@@ -1612,7 +1728,14 @@ int zmk_input_processor_runtime_set_rotation(const struct device *dev, int32_t d
         return -EINVAL;
     }
 
+    if (degrees != 0 && !zmk_runtime_input_rotation_has_processor(dev)) {
+        return -ENOTSUP;
+    }
+
     struct runtime_processor_data *data = dev->data;
+    if (data->rotation_degrees != degrees) {
+        inertia_stop(data, ZMK_INPUT_PROCESSOR_INERTIA_STOP_REASON_SETTINGS_CHANGED);
+    }
     data->rotation_degrees = degrees;
     if (mode != ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY) {
         data->persistent_rotation_degrees = degrees;
@@ -1726,12 +1849,16 @@ int zmk_input_processor_runtime_get_config(const struct device *dev, const char 
 }
 
 #define RUNTIME_PROCESSOR_INST(n)                                                                  \
+    BUILD_ASSERT(DT_INST_PROP_OR(n, scale_divisor, 1) >= 0 &&                                      \
+                     DT_INST_PROP_OR(n, scale_divisor, 1) <=                                       \
+                         ZMK_INPUT_PROCESSOR_RUNTIME_MAX_SCALE_DIVISOR,                            \
+                 "scale-divisor must fit the signed listener remainder");                          \
     static const uint16_t runtime_x_codes_##n[] = DT_INST_PROP(n, x_codes);                        \
     static const uint16_t runtime_y_codes_##n[] = DT_INST_PROP(n, y_codes);                        \
     BUILD_ASSERT(ARRAY_SIZE(runtime_x_codes_##n) == ARRAY_SIZE(runtime_y_codes_##n),               \
                  "X and Y codes need to be the same size");                                        \
-    BUILD_ASSERT(DT_INST_PROP_OR(n, inertia_normal_max_output, 0) <= INT16_MAX,                  \
-                 "normal inertia output limit exceeds signed report range");                    \
+    BUILD_ASSERT(DT_INST_PROP_OR(n, inertia_normal_max_output, 0) <= INT16_MAX,                    \
+                 "normal inertia output limit exceeds signed report range");                       \
     COND_CODE_1(DT_INST_NODE_HAS_PROP(n, temp_layer_keep_keycodes),                                \
                 (static const uint16_t runtime_temp_layer_keep_keycodes_##n[] =                    \
                      DT_INST_PROP(n, temp_layer_keep_keycodes);),                                  \
@@ -1778,16 +1905,15 @@ int zmk_input_processor_runtime_get_config(const struct device *dev, const char 
         .initial_xy_swap_enabled = DT_INST_PROP(n, xy_swap_enabled),                               \
         .initial_x_invert = DT_INST_PROP(n, x_invert),                                             \
         .initial_y_invert = DT_INST_PROP(n, y_invert),                                             \
-        .initial_inertia_enabled = DT_INST_PROP(n, inertia_enabled),                            \
-        .initial_inertia_window_ms = DT_INST_PROP_OR(n, inertia_window_ms, 200),             \
-        .initial_inertia_interval_ms = DT_INST_PROP_OR(n, inertia_interval_ms, 20),          \
-        .initial_inertia_threshold = DT_INST_PROP_OR(n, inertia_threshold, 12),              \
-        .initial_inertia_decay_percent =                                                        \
-            DT_INST_PROP_OR(n, inertia_decay_percent, 8),                                       \
-        .initial_inertia_normal_max_output = DT_INST_PROP_OR(n, inertia_normal_max_output, 0), \
-        .initial_inertia_fast_threshold = DT_INST_PROP_OR(n, inertia_fast_threshold, 20),       \
-        .initial_inertia_fast_output_percent =                                                 \
-            DT_INST_PROP_OR(n, inertia_fast_output_percent, 200),                                       \
+        .initial_inertia_enabled = DT_INST_PROP(n, inertia_enabled),                               \
+        .initial_inertia_window_ms = DT_INST_PROP_OR(n, inertia_window_ms, 200),                   \
+        .initial_inertia_interval_ms = DT_INST_PROP_OR(n, inertia_interval_ms, 20),                \
+        .initial_inertia_threshold = DT_INST_PROP_OR(n, inertia_threshold, 12),                    \
+        .initial_inertia_decay_percent = DT_INST_PROP_OR(n, inertia_decay_percent, 8),             \
+        .initial_inertia_normal_max_output = DT_INST_PROP_OR(n, inertia_normal_max_output, 0),     \
+        .initial_inertia_fast_threshold = DT_INST_PROP_OR(n, inertia_fast_threshold, 20),          \
+        .initial_inertia_fast_output_percent =                                                     \
+            DT_INST_PROP_OR(n, inertia_fast_output_percent, 200),                                  \
     };                                                                                             \
     static struct runtime_processor_data runtime_data_##n;                                         \
     DEVICE_DT_INST_DEFINE(n, &runtime_processor_init, NULL, &runtime_data_##n,                     \
@@ -1815,13 +1941,13 @@ DT_INST_FOREACH_STATUS_OKAY(RUNTIME_PROCESSOR_SETTINGS_INST)
 #if DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT)
 #define DEVICE_ADDR(idx) DEVICE_DT_GET(DT_DRV_INST(idx)),
 
-static struct device *runtime_processors[] = {DT_INST_FOREACH_STATUS_OKAY(DEVICE_ADDR)};
+static const struct device *const runtime_processors[] = {DT_INST_FOREACH_STATUS_OKAY(DEVICE_ADDR)};
 
 static const size_t runtime_processors_count = sizeof(runtime_processors) / sizeof(struct device *);
 
 #else
 
-static struct device *runtime_processors[] = {};
+static const struct device *const runtime_processors[] = {};
 static const size_t runtime_processors_count = 0;
 
 #endif
@@ -1849,7 +1975,7 @@ const struct device *zmk_input_processor_runtime_find_by_name(const char *name) 
     return NULL;
 }
 
-const struct device *zmk_input_processor_runtime_find_by_id(uint8_t id) {
+const struct device *zmk_input_processor_runtime_find_by_id(uint32_t id) {
     if (id < runtime_processors_count) {
         return runtime_processors[id];
     }
@@ -1944,8 +2070,10 @@ static int discard_processor_settings_cb(const struct device *dev, void *user_da
     struct runtime_processor_data *data = dev->data;
     const struct runtime_processor_config *cfg = dev->config;
 
-    // Reverting to the on-flash state; drop any pending debounced flush.
+    /* Serialize cancellation/reload with a worker that may already be running. */
+    k_mutex_lock(&data->save_lock, K_FOREVER);
     k_work_cancel_delayable(&data->save_work);
+    data->pending_save_valid = false;
 
     struct zmk_custom_setting_value value;
     int ret = zmk_custom_setting_read_by_key(RIP_SETTINGS_SUBSYSTEM_ID, cfg->name, &value);
@@ -1956,6 +2084,7 @@ static int discard_processor_settings_cb(const struct device *dev, void *user_da
         load_processor_defaults(dev);
         LOG_INF("Discarded unsaved changes for %s (no saved value, using defaults)", cfg->name);
     }
+    k_mutex_unlock(&data->save_lock);
     raise_state_changed_event(dev);
     return 0;
 }
@@ -1995,8 +2124,7 @@ bool zmk_input_processor_runtime_test_inertia_active(const struct device *dev) {
     return dev && ((struct runtime_processor_data *)dev->data)->inertia_active;
 }
 
-int zmk_input_processor_runtime_test_inertia_output_code(const struct device *dev,
-                                                             uint16_t *code) {
+int zmk_input_processor_runtime_test_inertia_output_code(const struct device *dev, uint16_t *code) {
     if (!dev || !code) {
         return -EINVAL;
     }
@@ -2057,6 +2185,8 @@ static int keycode_state_changed_listener(const zmk_event_t *eh) {
         const struct device *dev = runtime_processors[i];
         struct runtime_processor_data *data = dev->data;
         data->last_keypress_timestamp = now;
+        data->temp_layer_activation_pending = false;
+        k_work_cancel_delayable(&data->temp_layer_activation_work);
     }
 
     return ZMK_EV_EVENT_BUBBLE;
@@ -2088,7 +2218,7 @@ static int position_state_changed_listener(const zmk_event_t *eh) {
 
         // Check if the temp-layer layer has a non-transparent binding for this
         // position
-        zmk_keymap_layer_id_t temp_layer_layer_id = data->temp_layer_layer;
+        zmk_keymap_layer_id_t temp_layer_layer_id = data->temp_layer_active_layer;
         const struct zmk_behavior_binding *temp_layer_binding =
             zmk_keymap_get_layer_binding_at_idx(temp_layer_layer_id, ev->position);
 
@@ -2199,7 +2329,7 @@ static int position_state_changed_listener(const zmk_event_t *eh) {
         LOG_DBG("Deactivating temp-layer layer %d due to key press at position %d",
                 data->temp_layer_layer, ev->position);
         k_work_cancel_delayable(&data->temp_layer_deactivation_work);
-        int ret = zmk_keymap_layer_deactivate(data->temp_layer_layer, false);
+        int ret = zmk_keymap_layer_deactivate(data->temp_layer_active_layer, false);
         if (ret == 0) {
             data->temp_layer_layer_active = false;
             LOG_INF("Temp-layer layer %d deactivated by key press", data->temp_layer_layer);
@@ -2237,16 +2367,21 @@ ZMK_SUBSCRIPTION(runtime_processor_layer_listener, zmk_layer_state_changed);
 
 // Temp-layer layer configuration API
 int zmk_input_processor_runtime_set_temp_layer(const struct device *dev, bool enabled,
-                                               uint8_t layer, uint32_t activation_delay_ms,
+                                               uint32_t layer, uint32_t activation_delay_ms,
                                                uint32_t deactivation_delay_ms,
                                                enum zmk_input_processor_runtime_write_mode mode) {
-    if (!dev) {
+    if (!dev || layer > UINT8_MAX || activation_delay_ms > UINT16_MAX ||
+        deactivation_delay_ms > UINT16_MAX) {
         return -EINVAL;
     }
 
     struct runtime_processor_data *data = dev->data;
 
     data->temp_layer_enabled = enabled;
+    if (!enabled) {
+        data->temp_layer_activation_pending = false;
+        k_work_cancel_delayable(&data->temp_layer_activation_work);
+    }
     data->temp_layer_layer = layer;
     data->temp_layer_activation_delay_ms = activation_delay_ms;
     data->temp_layer_deactivation_delay_ms = deactivation_delay_ms;
@@ -2273,6 +2408,10 @@ int zmk_input_processor_runtime_set_temp_layer_enabled(
 
     struct runtime_processor_data *data = dev->data;
     data->temp_layer_enabled = enabled;
+    if (!enabled) {
+        data->temp_layer_activation_pending = false;
+        k_work_cancel_delayable(&data->temp_layer_activation_work);
+    }
 
     if (mode != ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY) {
         data->persistent_temp_layer_enabled = enabled;
@@ -2284,8 +2423,8 @@ int zmk_input_processor_runtime_set_temp_layer_enabled(
 }
 
 int zmk_input_processor_runtime_set_temp_layer_layer(
-    const struct device *dev, uint8_t layer, enum zmk_input_processor_runtime_write_mode mode) {
-    if (!dev) {
+    const struct device *dev, uint32_t layer, enum zmk_input_processor_runtime_write_mode mode) {
+    if (!dev || layer > UINT8_MAX) {
         return -EINVAL;
     }
 
@@ -2304,7 +2443,7 @@ int zmk_input_processor_runtime_set_temp_layer_layer(
 int zmk_input_processor_runtime_set_temp_layer_activation_delay(
     const struct device *dev, uint32_t activation_delay_ms,
     enum zmk_input_processor_runtime_write_mode mode) {
-    if (!dev) {
+    if (!dev || activation_delay_ms > UINT16_MAX) {
         return -EINVAL;
     }
 
@@ -2323,7 +2462,7 @@ int zmk_input_processor_runtime_set_temp_layer_activation_delay(
 int zmk_input_processor_runtime_set_temp_layer_deactivation_delay(
     const struct device *dev, uint32_t deactivation_delay_ms,
     enum zmk_input_processor_runtime_write_mode mode) {
-    if (!dev) {
+    if (!dev || deactivation_delay_ms > UINT16_MAX) {
         return -EINVAL;
     }
 
@@ -2361,7 +2500,7 @@ int zmk_input_processor_runtime_set_active_layers(
 }
 
 int zmk_input_processor_runtime_set_axis_snap_mode(
-    const struct device *dev, uint8_t mode,
+    const struct device *dev, uint32_t mode,
     enum zmk_input_processor_runtime_write_mode write_mode) {
     if (!dev) {
         return -EINVAL;
@@ -2387,9 +2526,9 @@ int zmk_input_processor_runtime_set_axis_snap_mode(
 }
 
 int zmk_input_processor_runtime_set_axis_snap_threshold(
-    const struct device *dev, uint16_t threshold,
+    const struct device *dev, uint32_t threshold,
     enum zmk_input_processor_runtime_write_mode mode) {
-    if (!dev) {
+    if (!dev || threshold > UINT16_MAX) {
         return -EINVAL;
     }
 
@@ -2406,9 +2545,9 @@ int zmk_input_processor_runtime_set_axis_snap_threshold(
 }
 
 int zmk_input_processor_runtime_set_axis_snap_timeout(
-    const struct device *dev, uint16_t timeout_ms,
+    const struct device *dev, uint32_t timeout_ms,
     enum zmk_input_processor_runtime_write_mode mode) {
-    if (!dev) {
+    if (!dev || timeout_ms > UINT16_MAX) {
         return -EINVAL;
     }
 
@@ -2425,9 +2564,9 @@ int zmk_input_processor_runtime_set_axis_snap_timeout(
 }
 
 int zmk_input_processor_runtime_set_axis_snap(
-    const struct device *dev, uint8_t mode, uint16_t threshold, uint16_t timeout_ms,
+    const struct device *dev, uint32_t mode, uint32_t threshold, uint32_t timeout_ms,
     enum zmk_input_processor_runtime_write_mode write_mode) {
-    if (!dev) {
+    if (!dev || threshold > UINT16_MAX || timeout_ms > UINT16_MAX) {
         return -EINVAL;
     }
 
@@ -2536,7 +2675,7 @@ int zmk_input_processor_runtime_set_inertia_interval(
 }
 
 int zmk_input_processor_runtime_set_inertia_threshold(
-    const struct device *dev, uint16_t threshold,
+    const struct device *dev, uint32_t threshold,
     enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev || threshold == 0) {
         return -EINVAL;
@@ -2589,8 +2728,7 @@ int zmk_input_processor_runtime_set_inertia_normal_max_output(
 }
 
 int zmk_input_processor_runtime_set_inertia_enabled(
-    const struct device *dev, bool enabled,
-    enum zmk_input_processor_runtime_write_mode mode) {
+    const struct device *dev, bool enabled, enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev) {
         return -EINVAL;
     }
@@ -2604,7 +2742,7 @@ int zmk_input_processor_runtime_set_inertia_enabled(
 }
 
 int zmk_input_processor_runtime_set_inertia_fast_threshold(
-    const struct device *dev, uint16_t threshold,
+    const struct device *dev, uint32_t threshold,
     enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev) {
         return -EINVAL;
@@ -2619,8 +2757,7 @@ int zmk_input_processor_runtime_set_inertia_fast_threshold(
 }
 
 int zmk_input_processor_runtime_set_inertia_fast_output_percent(
-    const struct device *dev, uint16_t percent,
-    enum zmk_input_processor_runtime_write_mode mode) {
+    const struct device *dev, uint16_t percent, enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev || percent < 100 || percent > 1000) {
         return -EINVAL;
     }
@@ -2641,10 +2778,10 @@ int zmk_input_processor_runtime_set_inertia_notifications(const struct device *d
     data->inertia_notifications_enabled = enabled;
     if (enabled) {
         raise_zmk_input_processor_inertia_state_changed(
-            (struct zmk_input_processor_inertia_state_changed){.dev = dev,
-                                                                .state = data->inertia_active
-                                                                             ? ZMK_INPUT_PROCESSOR_INERTIA_STARTED
-                                                                             : ZMK_INPUT_PROCESSOR_INERTIA_STOPPED});
+            (struct zmk_input_processor_inertia_state_changed){
+                .dev = dev,
+                .state = data->inertia_active ? ZMK_INPUT_PROCESSOR_INERTIA_STARTED
+                                              : ZMK_INPUT_PROCESSOR_INERTIA_STOPPED});
     }
     raise_state_changed_event(dev);
     return 0;

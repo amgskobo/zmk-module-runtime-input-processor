@@ -24,6 +24,12 @@
 		>;
 	};
 
+    runtime_rotation: runtime_rotation {
+        compatible = "zmk,runtime-input-rotation";
+        device = <&mmv>;
+        processor = <&runtime_input_processor>;
+    };
+
 	runtime_input_processor: runtime_input_processor {
 		compatible = "zmk,input-processor-runtime";
 		processor-label = "default";
@@ -44,6 +50,7 @@
 #include <behaviors/runtime-input-processor.dtsi>
 
 &mmv_input_listener {
+    device = <&runtime_rotation>;
 	input-processors = <&runtime_input_processor>;
 };
 

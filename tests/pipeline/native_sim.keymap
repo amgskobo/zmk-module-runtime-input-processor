@@ -1,0 +1,73 @@
+#include "../test.dtsi"
+#include <input/processors.dtsi>
+
+/ {
+    second_processor: second_processor {
+        compatible = "zmk,input-processor-runtime";
+        processor-label = "second";
+        type = <INPUT_EV_REL>;
+        x-codes = <INPUT_REL_X>;
+        y-codes = <INPUT_REL_Y>;
+        scale-multiplier = <1>;
+        scale-divisor = <1>;
+        track-remainders;
+        #input-processor-cells = <0>;
+    };
+    runtime_pipeline: runtime_pipeline {
+        compatible = "zmk,runtime-input-pipeline";
+        input-device = <&mmv>;
+        input-processors = <&runtime_input_processor>,
+                           <&zip_xy_transform 2>,
+                           <&second_processor>;
+    };
+};
+&runtime_rotation { status = "disabled"; };
+&runtime_input_processor { /delete-property/ inertia-enabled; };
+&mmv_input_listener {
+    device = <&runtime_pipeline>;
+    input-processors = <&zip_xy_scaler 2 1>;
+};
+&kscan { events = <>; /delete-property/ exit-after; };
+
+/ {
+    inline_processor: inline_processor {
+        compatible = "zmk,input-processor-runtime";
+        processor-label = "inline";
+        type = <INPUT_EV_REL>;
+        x-codes = <INPUT_REL_X>;
+        y-codes = <INPUT_REL_Y>;
+        scale-multiplier = <1>;
+        scale-divisor = <1>;
+        #input-processor-cells = <0>;
+    };
+    behaviors {
+        held_dpi: held_dpi {
+            compatible = "zmk,behavior-input-processor-temp-config";
+            processor-name = "default";
+            scale-multiplier = <3>;
+            scale-divisor = <1>;
+            #binding-cells = <0>;
+        };
+        newer_dpi: newer_dpi {
+            compatible = "zmk,behavior-input-processor-temp-config";
+            processor-name = "default";
+            scale-multiplier = <5>;
+            scale-divisor = <1>;
+            #binding-cells = <0>;
+        };
+        held_snap: held_snap {
+            compatible = "zmk,behavior-input-processor-axis-snap";
+            processor-name = "default";
+            timeout-ms = <1000>;
+            #binding-cells = <2>;
+        };
+        unsupported_rotation: unsupported_rotation {
+            compatible = "zmk,behavior-input-processor-temp-config";
+            processor-name = "inline";
+            scale-multiplier = <3>;
+            scale-divisor = <1>;
+            rotation-degrees = <15>;
+            #binding-cells = <0>;
+        };
+    };
+};

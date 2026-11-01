@@ -11,7 +11,7 @@
 #include <zmk/pointing/input_processor_runtime.h>
 
 struct zmk_input_processor_state_changed {
-    uint8_t id;
+    uint32_t id;
     const char *name;
     struct zmk_input_processor_runtime_config config;
 };

@@ -4,6 +4,90 @@ config ZMK_RUNTIME_INPUT_PROCESSOR
 
 if ZMK_RUNTIME_INPUT_PROCESSOR
 
+DT_COMPAT_ZMK_RUNTIME_INPUT_PIPELINE := zmk,runtime-input-pipeline
+
+config ZMK_RUNTIME_INPUT_PROCESSOR_TEMP_OVERRIDES
+    int "Simultaneously held temporary pointing configurations"
+    default 8
+    range 1 64
+    depends on ZMK_RUNTIME_INPUT_PROCESSOR
+    help
+      Maximum active behavior/position pairs for temporary DPI and axis snap.
+      A press beyond this capacity is refused without changing the processor.
+
+config ZMK_RUNTIME_INPUT_PIPELINE
+    bool
+    default $(dt_compat_enabled,$(DT_COMPAT_ZMK_RUNTIME_INPUT_PIPELINE))
+    depends on INPUT && INPUT_MODE_THREAD
+
+if ZMK_RUNTIME_INPUT_PIPELINE
+
+config ZMK_RUNTIME_INPUT_PIPELINE_FRAME_EVENTS
+    int "Maximum source events per pipeline frame"
+    default 16
+    range 2 64
+
+config ZMK_RUNTIME_INPUT_PIPELINE_OUTPUT_EVENTS
+    int "Maximum events after each pipeline stage"
+    default 32
+    range 2 128
+
+config ZMK_RUNTIME_INPUT_PIPELINE_QUEUE_FRAMES
+    int "Queued complete pipeline frames"
+    default 8
+    range 1 32
+
+config ZMK_RUNTIME_INPUT_PIPELINE_STACK_SIZE
+    int "Pipeline output worker stack size"
+    default 4096
+    range 2048 8192
+
+config ZMK_RUNTIME_INPUT_PIPELINE_INIT_PRIORITY
+    int "Pipeline init priority after its source and processors"
+    default 95
+
+config ZMK_RUNTIME_INPUT_PIPELINE_TEST
+    bool "Enable pipeline test hooks"
+    depends on ARCH_POSIX
+    default n
+
+endif
+
+DT_COMPAT_ZMK_RUNTIME_INPUT_ROTATION := zmk,runtime-input-rotation
+
+config ZMK_RUNTIME_INPUT_ROTATION
+    bool
+    default $(dt_compat_enabled,$(DT_COMPAT_ZMK_RUNTIME_INPUT_ROTATION))
+    depends on INPUT
+
+if ZMK_RUNTIME_INPUT_ROTATION
+
+config ZMK_RUNTIME_INPUT_ROTATION_FRAME_EVENTS
+    int "Maximum source events per rotation frame"
+    default 16
+    range 2 64
+
+config ZMK_RUNTIME_INPUT_ROTATION_QUEUE_FRAMES
+    int "Queued complete rotation frames"
+    default 8
+    range 1 32
+
+config ZMK_RUNTIME_INPUT_ROTATION_STACK_SIZE
+    int "Rotation output worker stack size"
+    default 2048
+    range 1024 8192
+
+config ZMK_RUNTIME_INPUT_ROTATION_INIT_PRIORITY
+    int "Rotation source init priority after its input device"
+    default 95
+
+config ZMK_RUNTIME_INPUT_ROTATION_TEST
+    bool "Enable owner rotation pipeline tests"
+    depends on ARCH_POSIX
+    default n
+
+endif
+
 config ZMK_RUNTIME_INPUT_PROCESSOR_INERTIA_WINDOW_SLICES
     int "Number of time slices in an inertia measurement window"
     range 4 254

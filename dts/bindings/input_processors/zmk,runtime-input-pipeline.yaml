@@ -1,0 +1,18 @@
+# Copyright (c) 2026 The ZMK Contributors
+# SPDX-License-Identifier: MIT
+
+description: |
+  Complete-frame input pipeline. Runs processors in declaration order, expanding
+  each runtime processor's rotation at that stage. Attach exactly one final ZMK
+  input listener to this device. Put HID-boundary processors such as shared
+  Inertia in that listener, after the virtual pipeline.
+
+compatible: "zmk,runtime-input-pipeline"
+include: base.yaml
+properties:
+  input-device:
+    type: phandle
+    required: true
+  input-processors:
+    type: phandle-array
+    required: true

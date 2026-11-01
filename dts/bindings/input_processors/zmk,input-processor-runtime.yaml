@@ -40,7 +40,7 @@ properties:
   scale-divisor:
     type: int
     default: 1
-    description: Initial scaling divisor
+    description: Initial scaling divisor (1..32768; 0 disables scaling)
 
   rotation-degrees:
     type: int

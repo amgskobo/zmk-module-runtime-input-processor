@@ -1,5 +1,6 @@
 import platform
-import shutil
+import os
+import tempfile
 import subprocess
 import unittest
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 from dataclasses import dataclass
 
 THIS_DIR = Path(__file__).parent.resolve()
+
 
 def run_west(args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -16,9 +18,11 @@ def run_west(args: list[str]) -> subprocess.CompletedProcess[str]:
         cwd=THIS_DIR,
     )
 
+
 @dataclass
 class NotFound:
     text: str
+
 
 class WestCommandsTests(unittest.TestCase):
     WEST_TOPDIR: Path
@@ -26,21 +30,48 @@ class WestCommandsTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.WEST_TOPDIR = Path(subprocess.run(
-            ["west", "topdir"],
-            capture_output=True,
+        cls.WEST_TOPDIR = Path(
+            subprocess.run(
+                ["west", "topdir"],
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        selected = os.environ.get("OWNER_TEST_OUTPUT")
+        cls.OUTPUT = (
+            Path(selected).resolve()
+            if selected
+            else Path(tempfile.mkdtemp(prefix="rip-owner-"))
+        )
+        if selected:
+            cls.OUTPUT.mkdir(parents=True, exist_ok=False)
+        cls.BUILD_DIR = cls.OUTPUT / "firmware"
+
+    def test_review_regressions(self):
+        result = subprocess.run(
+            ["python3", "-m", "unittest", "discover", "-s", "tests/review", "-v"],
+            cwd=THIS_DIR,
             text=True,
-        ).stdout.strip())
-        cls.BUILD_DIR = cls.WEST_TOPDIR / "build"
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        (self.OUTPUT / "review.log").write_text(result.stdout)
+        self.assertEqual(result.returncode, 0, result.stdout)
 
-    @unittest.skipUnless(platform.system() == "Linux", "zmk-test is only supported on Linux")
+    @unittest.skipUnless(
+        platform.system() == "Linux", "zmk-test is only supported on Linux"
+    )
     def test_zmk_test(self):
-        tests_build = self.BUILD_DIR / "tests"
-        shutil.rmtree(tests_build, ignore_errors=True)
-
-        result = run_west(["zmk-test", "tests", '-m', '.'])
+        tests_build = self.OUTPUT / "native"
+        result = run_west(["zmk-test", "tests", "-m", ".", "-d", str(tests_build)])
+        (self.OUTPUT / "native.log").write_text(result.stdout + result.stderr)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("PASS: studio", result.stdout,  result.stdout + result.stderr)
+        self.assertIn("PASS: studio", result.stdout, result.stdout + result.stderr)
+        self.assertIn("PASS: rotation", result.stdout, result.stdout + result.stderr)
+        self.assertIn("PASS: pipeline", result.stdout, result.stdout + result.stderr)
+        from tests_native import verify_native
+
+        verify_native(tests_build, THIS_DIR / "tests")
 
     def test_zmk_build(self):
         artifacts_and_expected_config: dict[str, list[str | NotFound]] = {
@@ -48,12 +79,14 @@ class WestCommandsTests(unittest.TestCase):
                 "CONFIG_MY_AWESOME_KEYBOARD_SPECIAL_FEATURE=y",
                 "CONFIG_ZMK_STUDIO=y",
                 "CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR=y",
+                "CONFIG_ZMK_RUNTIME_INPUT_ROTATION=y",
                 "CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_STUDIO_RPC=y",
             ],
             "my_awesome_keyboard_without_custom_rpc_support": [
                 "CONFIG_MY_AWESOME_KEYBOARD_SPECIAL_FEATURE=y",
                 "# CONFIG_ZMK_STUDIO is not set",
                 "CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR=y",
+                "CONFIG_ZMK_RUNTIME_INPUT_ROTATION=y",
                 NotFound("CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_STUDIO_RPC"),
             ],
             # Hardware-free Renode testing artifact (see README.md's
@@ -66,6 +99,7 @@ class WestCommandsTests(unittest.TestCase):
             "renode_smoke_test": [
                 "CONFIG_ZMK_STUDIO=y",
                 "CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR=y",
+                "CONFIG_ZMK_RUNTIME_INPUT_ROTATION=y",
                 "CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_STUDIO_RPC=y",
                 "CONFIG_ZMK_RENODE_STUDIO_UART_TRANSPORT=y",
                 "# CONFIG_ZMK_STUDIO_TRANSPORT_UART is not set",
@@ -73,20 +107,24 @@ class WestCommandsTests(unittest.TestCase):
             ],
         }
 
-        for artifact in artifacts_and_expected_config.keys():
-            shutil.rmtree(self.BUILD_DIR / artifact, ignore_errors=True)
-
-        result = run_west([
-            "zmk-build",
-            "tests/zmk-config/config",
-            "-m",
-            "tests/zmk-config",
-            ".",
-            "--extra-module-auto-discovery",
-            "zmk-config",
-            "current",
-            "-q",
-        ])
+        result = run_west(
+            [
+                "zmk-build",
+                "tests/zmk-config/config",
+                "-m",
+                "tests/zmk-config",
+                ".",
+                "--extra-module-auto-discovery",
+                "zmk-config",
+                "current",
+                "-q",
+                "-d",
+                str(self.BUILD_DIR),
+                "--parallelism",
+                "1",
+            ]
+        )
+        (self.OUTPUT / "firmware.log").write_text(result.stdout + result.stderr)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
         for artifact, entries in artifacts_and_expected_config.items():
@@ -96,11 +134,17 @@ class WestCommandsTests(unittest.TestCase):
             for entry in entries:
                 if isinstance(entry, NotFound):
                     if entry.text in config_text:
-                        self.fail(f"{entry.text} found in {config_path} for {artifact}, but it should not be present")
+                        self.fail(
+                            f"{entry.text} found in {config_path} for {artifact}, but it should not be present"
+                        )
                 else:
                     if entry not in config_text:
                         self.fail(f"{entry} not found in {config_path} for {artifact}")
-            self.assertTrue((config_path.parent / "zmk.uf2").exists(), f"{artifact} zmk.uf2 is missing in {config_path.parent}")
+            self.assertTrue(
+                (config_path.parent / "zmk.uf2").exists(),
+                f"{artifact} zmk.uf2 is missing in {config_path.parent}",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

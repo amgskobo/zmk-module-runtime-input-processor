@@ -7,7 +7,7 @@ This ZMK module provides runtime configurable input processors for pointing devi
 - **Runtime Configuration**: Adjust input processor parameters without rebuilding firmware
 - **Web Interface**: Configure settings through a browser-based UI
 - **Scaling Support**: Configure speed multipliers (e.g., x2 faster, x0.5 slower)
-- **Rotation Support**: Apply rotation transformations in degrees (fully implemented with paired X/Y handling)
+- **Rotation Support**: Arbitrary integer angles through a module-owned virtual input source, with complete X/Y frames and fractional movement retention
 - **Axis Reversing**: Invert X and/or Y axis independently to reverse input direction
 - **Inertia**: Continue input after a rapid, configurable directional movement
 - **Axis Snapping**: Lock scrolling to X or Y axis with threshold-based unlock
@@ -24,22 +24,24 @@ This ZMK module provides runtime configurable input processors for pointing devi
 ```yaml
 manifest:
   remotes:
+    - name: amgskobo
+      url-base: https://github.com/amgskobo
     - name: cormoran
       url-base: https://github.com/cormoran
   projects:
     - name: zmk-module-runtime-input-processor
-      remote: cormoran
-      revision: main # or latest commit hash
+      remote: amgskobo
+      revision: codex/runtime-input-processor-review
     # Below setting required to use unofficial studio custom RPC feature
     - name: zmk
       remote: cormoran
-      revision: v0.3+custom-studio-protocol
+      revision: e5c9b6915b56801193e359dd9bad4a167ce0d1b8
       import:
         file: app/west.yml
     # Persistent settings storage backend used by this module
     - name: zmk-feature-custom-settings
-      remote: cormoran
-      revision: main
+      remote: amgskobo
+      revision: b91a8ceb0a57a0cf41b34270752d79463e2848fa
 ```
 
 ### 2. Enable the feature in your `config/<shield>.conf`
@@ -67,7 +69,7 @@ CONFIG_ZMK_LOW_PRIORITY_THREAD_STACK_SIZE=2048
 > keyboard config as shown above.
 
 `CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR` automatically selects `CONFIG_ZMK_CUSTOM_SETTINGS`
-(from [zmk-feature-custom-settings](https://github.com/cormoran/zmk-feature-custom-settings)),
+(from [zmk-feature-custom-settings](https://github.com/amgskobo/zmk-feature-custom-settings)),
 which this module uses purely as a typed persistence backend for the settings described
 below - `zmk-feature-custom-settings`'s own Studio RPC surface is not required and is not
 enabled by this module (the RPC/web UI in this repo is unaffected and unofficial-Studio-RPC
@@ -97,11 +99,11 @@ compatible as before).
 
     // For split keyboard, you can configure input processor in central
     split_input: split_input {
-        compatible = "zmk,input-split"
+        compatible = "zmk,input-split";
     };
     split_listener: split_listener {
         compatible = "zmk,input-listener";
-        status = <disabled>;
+        status = "disabled";
         device = <&split_input>;
     };
 
@@ -144,7 +146,86 @@ compatible as before).
 };
 ```
 
+### 4. Route arbitrary-angle rotation through a virtual input source
+
+Rotation can turn a pure X input into both X and Y outputs. The ordinary ZMK
+input-processor interface returns one event, so rotation uses a virtual source
+provided entirely by this module. ZMK itself needs no patch. Scaling-only inline
+configurations continue to work; setting a nonzero angle without a virtual source returns `-ENOTSUP` before
+changing settings. An old persisted nonzero angle on an inline source is left
+unapplied, with one diagnostic, so input continues until the DTS routing is
+migrated.
+
+For the split input and processor above, add a virtual source and change the
+listener's device. Keep the runtime processor in its processor list:
+
+```dts
+/ {
+    rotated_input: rotated_input {
+        compatible = "zmk,runtime-input-rotation";
+        device = <&split_input>;
+        processor = <&my_rip>;
+    };
+};
+
+&split_listener {
+    device = <&rotated_input>;
+    input-processors = <&my_rip>;
+};
+```
+
+`device` can also reference a local pointing device. Attach its listener only
+to the virtual source to avoid processing the physical input a second time.
+Other listener processors run after the rotation; retain their order after
+`my_rip`. Any processor that previously preceded `my_rip` now receives rotated
+coordinates, so review that ordering when migrating a longer chain.
+
+The virtual source supports one relative X/Y code pair per runtime processor.
+It collects events through the source's `sync` boundary, emits both rotated axes,
+and preserves other events and one final sync. Pure X, pure Y, reversed axis
+order and independent devices are supported. Small fractional movements carry
+into later frames. Changes in the effective rotation retire the old fraction;
+output saturates at the signed 16-bit pointing boundary. Inversion, snapping,
+scaling and the existing remaining runtime processing follow rotation.
+
+Complete frames wait on a dedicated output worker, allowing it to wait for
+Zephyr input-queue capacity without blocking the input callback. The default
+limits are 16 source events per frame and 8 queued frames, configurable with
+`CONFIG_ZMK_RUNTIME_INPUT_ROTATION_FRAME_EVENTS` and
+`CONFIG_ZMK_RUNTIME_INPUT_ROTATION_QUEUE_FRAMES`. A frame that exceeds either
+bound is dropped as a whole and logged; the next valid frame starts cleanly.
+These finite buffers do not guarantee delivery under sustained overload.
+Initialization must follow the source device; use
+`CONFIG_ZMK_RUNTIME_INPUT_ROTATION_INIT_PRIORITY` if its default 95 is too early
+for a custom driver.
+
 ## Usage
+
+### Ordered complete-frame pipelines
+
+For a chain with more than one runtime processor, use
+`compatible = "zmk,runtime-input-pipeline"`, with `input-device` pointing to
+the sensor and `input-processors` listing the ordered stages. Each runtime
+stage rotates the current X/Y pair before its remaining processing. Later
+stages therefore see mapped scroll codes and transformed coordinates, rather
+than the original sensor frame. Fractional rotation and scaling state belong
+to each stage and source. Attach exactly one final `zmk,input-listener` to the
+pipeline; shared Inertia belongs in that final listener so HID emission stays
+on Zephyr's input thread. The final listener's index is passed to processors.
+
+The pipeline has a bounded frame queue and a dedicated output worker. An
+oversized source frame or a full queue drops that complete frame. Dropped
+frames retire fractional state before the next accepted generation. Invalid
+processor results or output expansion beyond the configured limit also drop
+the complete output frame. `CONFIG_ZMK_RUNTIME_INPUT_PIPELINE_*` controls frame
+and output capacity, queue length, worker stack and initialization priority.
+Finite queues do not guarantee lossless delivery during sustained overload.
+
+The `tests/pipeline` native case covers two runtime rotations separated by a
+core transform, a downstream scaler, fractional frames, buttons, scroll,
+oversized frames and queue-full recovery. Repeat the built binary with
+`bash tests/pipeline/repeat.sh NATIVE_EXECUTABLE FRESH_OUTPUT` for three
+independent process starts, retaining each ordered log and the binary hash.
 
 ### Web Interface
 
@@ -189,6 +270,10 @@ and the setters take a `zmk_input_processor_runtime_write_mode`
   - Example: `2/1` = 2x faster, `1/2` = 0.5x slower
   - Values are applied as: `output = input * multiplier / divisor`
   - Remainders are tracked for precise scaling
+  - The divisor is limited to `1..32768` so fractional remainders fit the
+    listener's signed 16-bit storage. Larger divisors are rejected before
+    changing the live or saved configuration. Scaled output saturates to the
+    signed 16-bit range.
 
 - **Inertia**: Starts continuous input after rapid same-direction movement
   - `inertia-enabled` enables the feature per processor (off by default;
@@ -281,9 +366,15 @@ You can temporarily change input processor settings while holding a key, useful 
 
 When you press and hold a key with the temporary config behavior:
 
-1. Current settings are saved
-2. Temporary settings are applied
-3. When you release the key, original settings are restored
+1. Each held behavior/position owns only its requested scaling and nonzero rotation.
+2. On a behavior press, the latest held owner wins independently for each field. A zero rotation leaves the current angle unchanged.
+3. Releasing a key restores the next held owner for those fields, or the persistent baseline. Other held settings stay active.
+
+Temporary DPI and axis snap share a bounded pool, configured with
+`CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_TEMP_OVERRIDES` (default 8). An unsupported
+angle or a full pool refuses the press before any setting changes. Releasing a
+refused press is harmless. Direct runtime setting updates still apply immediately;
+release uses the current persistent baseline when no other behavior owns a field.
 
 ### Temp-Layer Layer
 
@@ -477,13 +568,21 @@ You can also configure the timeout in the behavior definition:
 
 When you press and hold the snap behavior key:
 
-1. Current snap settings are saved
-2. Temporary snap settings are applied (with 1000ms timeout)
-3. When you release the key, original settings are restored
+1. The pressed behavior/position owns the requested mode, threshold and timeout.
+2. It remains independent of a held DPI key; overlapping snap owners use latest-press order.
+3. Release restores the next held snap owner or the persistent baseline without changing DPI.
 
 ## Development Guide
 
 ### Setup
+
+Run dependency preparation, tests and builds inside Docker. The CI image is
+pinned by digest in `.github/workflows/zmk-module.yml`; use the same image for
+local verification. Test dependencies select the exact DYA ZMK, Zephyr and
+`zmk-west-commands` revisions in `west/west-dependency/west-test-dependency.yml`.
+The Custom Settings fork commit is shared with the production manifest.
+Prepare those revisions explicitly before an ordinary test run. Local dirty
+sources are a separate snapshot from the published review-branch commit.
 
 There are two west workspace layout options.
 
@@ -495,8 +594,8 @@ This option is west's standard way. Choose this option if you want to re-use dep
 mkdir west-workspace
 cd west-workspace # this directory becomes west workspace root (topdir)
 git clone <this repository>
-# rm -r .west # if exists to reset workspace
-west init -l . --mf tests/west-test.yml
+cd <cloned directory>
+west init -l . --mf west/west-test.yml
 west update --narrow
 west zephyr-export
 ```
@@ -516,7 +615,7 @@ west-workspace
   - your-other-repo
 ```
 
-You can switch between modules by removing `west-workspace/.west` and re-executing `west init ...`.
+Select the owner manifest explicitly in the existing workspace; do not update shared dependency checkouts implicitly.
 
 #### Option2: Download dependencies in ./dependencies (Enabled in dev-container)
 
@@ -558,6 +657,14 @@ Please refer [./web/README.md](./web/README.md).
 
 ## Test
 
+The `rotation` native case runs the actual virtual source,
+input queues, listener and a downstream scaler with a recording HID sink. They
+cover arbitrary angles, current-frame pairing, two sources, button/scroll order,
+one final sync, oversized frames and queue-full recovery with Zephyr's threaded input mode, which the selected ZMK core requires. GPIO/radio/physical mouse delivery remains a separate hardware check. Reuse a built
+native binary for three identical process starts with
+`bash tests/rotation/repeat.sh /path/to/zmk.exe /absolute/new/output`; the entry
+retains its binary hash, ordered logs and all required snapshot markers.
+
 **ZMK firmware test**
 
 `./tests` directory contains test config for posix to confirm module functionality and config for xiao board to confirm build works.
@@ -566,8 +673,22 @@ Tests can be executed by below command:
 
 ```bash
 # Run all test case and verify results
-python -m unittest
+OWNER_TEST_OUTPUT="$PWD/build/owner-tests" python3 -m unittest -v
 ```
+
+Choose a fresh output directory for every run. The canonical entry runs the
+numerical/UBSan controls, all three firmware variants, every native fixture,
+and the owner pipeline/rotation repeat scripts. Native binaries are built once
+and run three times in separate initial-state directories; logs and hashes are
+retained. The Studio fixture uses real nanopb/custom-subsystem dispatch to
+check full-width IDs and field bounds, Get response presence/XY flags, and
+PERSIST followed by MEMORY before a debounce flush. A memory-only edit must
+not change the already captured durable snapshot. Gain/settings changes also
+retire fractional remainders independently for each source/axis.
+
+The Web fixture retains edited gain/rotation when activity notifications arrive
+before or after an activity-toggle response. Review-branch pushes run Web
+checks/builds; Pages deployment is limited to `main`.
 
 If you want to execute west command manually, run below. (for zmk-build, the result is not verified.)
 
@@ -598,39 +719,24 @@ ZMK boot banner, a core Studio RPC `GetDeviceInfo` round trip, and this
 module's own custom Studio RPC subsystem (`cormoran_rip`). This is a *step*
 in the `Build` job in `.github/workflows/zmk-module.yml` (not a separate
 job) -- it tests the `renode_smoke_test` artifact `python3 -m unittest -v`
-already built (see `tests/zmk-config/build.yaml`) using a reusable action,
-[`cormoran/zmk-workspace`'s
-`zmk-renode-test`](https://github.com/cormoran/zmk-workspace/tree/main/.github/actions/zmk-renode-test).
-**That action does not build firmware** -- this module's own build flow
-does, using this module's `renode-studio-uart` Zephyr snippet (see
-`tests/zmk-config/build.yaml`); the action only boots the
-resulting ELF and runs tests against it.
+already built (see `tests/zmk-config/build.yaml`) using the pinned
+[`zmk-west-commands` action](https://github.com/cormoran/zmk-west-commands/tree/536260056f362edb2092905f2a75317bc8cb9bc2/.github/actions/zmk-renode-test).
+The action boots an existing ELF and runs the module cases; it does not build.
+The module supplies its `renode-studio-uart` snippet/transport for this fixture.
+The helper's generic BLE smoke is boot liveness without a host ELF; the owner
+suite separately exercises its UART custom RPC transport. Neither establishes
+physical USB/BLE delivery.
 
-To reproduce locally (after the usual `west update`, which also fetches
-`zmk-workspace` into `dependencies/zmk-workspace`):
+Run the owner build first in the prepared container, then select its exact ELF:
 
 ```bash
-# 1. Build the Renode-testable artifact (Studio-RPC-over-UART overlay + the
-#    Renode-only transport that bypasses the USB-gated real one -- real
-#    hardware still uses the studio-rpc-usb-uart snippet as normal). This
-#    builds every tests/zmk-config/build.yaml artifact; -af filters to just
-#    the Renode one by (substring) artifact name.
-west zmk-build tests/zmk-config -af renode
-# (equivalent to letting the full `python3 -m unittest -v` build sweep run)
-
-# 2. Generic smoke test (boot banner + core Studio RPC). --elf must be
-#    absolute: Renode is launched with the skill's own directory as its
-#    cwd, so a relative ELF path resolves against the wrong location and
-#    silently fails to boot (Renode logs are suppressed by --hide-log).
-python3 dependencies/zmk-workspace/skills/test-zmk-renode/scripts/renode_smoke.py \
-  --elf "$PWD/build/renode_smoke_test/zephyr/zmk.elf" --west-topdir "$PWD"
-
-# 3. This module's own Renode test (custom Studio RPC subsystem). PYTHONPATH
-#    is optional -- tests/renode/renode_test.py falls back to
-#    dependencies/zmk-workspace/skills/test-zmk-renode/scripts automatically.
-ZMK_RENODE_ELF="$PWD/build/renode_smoke_test/zephyr/zmk.elf" \
-python3 tests/renode/renode_test.py -v
+west zmk-renode-test tests/renode \
+  --elf "$PWD/build/owner-tests/firmware/renode_smoke_test/zephyr/zmk.elf"
 ```
+
+The pinned helper supplies `renode_harness` on `PYTHONPATH`. Direct execution
+resolves that same selected helper through `west list`, without a sibling
+workspace assumption.
 
 `tests/renode/renode_test.py`'s own module docstring documents a known
 Renode-only limitation (custom-subsystem responses carrying real data time

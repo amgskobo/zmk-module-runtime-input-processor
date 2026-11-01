@@ -1,0 +1,30 @@
+#include "../test.dtsi"
+#include <input/processors.dtsi>
+
+/ {
+    second_processor: second_processor {
+        compatible = "zmk,input-processor-runtime";
+        processor-label = "rot2";
+        type = <INPUT_EV_REL>;
+        x-codes = <INPUT_REL_HWHEEL>;
+        y-codes = <INPUT_REL_WHEEL>;
+        scale-multiplier = <1>;
+        scale-divisor = <1>;
+        #input-processor-cells = <0>;
+    };
+    second_rotation: second_rotation {
+        compatible = "zmk,runtime-input-rotation";
+        device = <&msc>;
+        processor = <&second_processor>;
+    };
+};
+&runtime_input_processor { /delete-property/ inertia-enabled; };
+&mmv_input_listener {
+    device = <&runtime_rotation>;
+    input-processors = <&runtime_input_processor &zip_xy_scaler 2 1>;
+};
+&msc_input_listener {
+    device = <&second_rotation>;
+    input-processors = <&second_processor>;
+};
+&kscan { events = <>; /delete-property/ exit-after; };

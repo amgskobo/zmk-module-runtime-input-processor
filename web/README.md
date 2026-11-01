@@ -1,4 +1,4 @@
-# ZMK Module Template - Web Frontend
+# Runtime Input Processor - Web Frontend
 
 This is a minimal web application template for interacting with ZMK firmware
 modules that implement custom Studio RPC subsystems.
@@ -11,11 +11,15 @@ modules that implement custom Studio RPC subsystems.
 - **react-zmk-studio**: Uses the `@cormoran/zmk-studio-react-hook` library for
   simplified ZMK integration
 
+Use Node 24.18.0 and the committed lockfile in a prepared Docker environment.
+The Studio client declaration selects the same exact Git revision as its lock.
+Run schema generation before Jest, then build and lint as separate checks.
+
 ## Quick Start
 
 ```bash
 # Install dependencies
-npm install
+npm ci
 
 # Generate TypeScript types from proto
 npm run generate
@@ -42,8 +46,9 @@ src/
         └── custom.ts
 
 test/
-├── App.spec.tsx              # Tests for App component
-└── RPCTestSection.spec.tsx   # Tests for RPC functionality
+├── App.spec.tsx                 # Connection and locked UI
+├── InertiaToggle.spec.tsx       # Inertia settings and activity
+└── DraftNotification.spec.tsx   # Draft preservation across activity replies
 ```
 
 ## How It Works

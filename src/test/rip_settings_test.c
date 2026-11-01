@@ -63,8 +63,7 @@ static int test_inertia_state_listener(const zmk_event_t *eh) {
     if (ev) {
         if (ev->state == ZMK_INPUT_PROCESSOR_INERTIA_FAST_INPUT_STARTED ||
             ev->state == ZMK_INPUT_PROCESSOR_INERTIA_FAST_INPUT_STOPPED) {
-            last_inertia_fast_input =
-                ev->state == ZMK_INPUT_PROCESSOR_INERTIA_FAST_INPUT_STARTED;
+            last_inertia_fast_input = ev->state == ZMK_INPUT_PROCESSOR_INERTIA_FAST_INPUT_STARTED;
             inertia_fast_input_transitions++;
         } else if (ev->state == ZMK_INPUT_PROCESSOR_INERTIA_STOPPED) {
             last_inertia_stop_reason = ev->stop_reason;
@@ -355,8 +354,7 @@ static int test_inertia(void) {
         dev, false, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY);
     int32_t output;
     uint16_t output_code;
-    if (ret < 0 ||
-        (ret = process_test_relative_x_with_code(dev, 30, &output, &output_code)) < 0) {
+    if (ret < 0 || (ret = process_test_relative_x_with_code(dev, 30, &output, &output_code)) < 0) {
         return ret;
     }
     if (output_code != INPUT_REL_HWHEEL || zmk_input_processor_runtime_test_inertia_active(dev)) {
@@ -366,7 +364,7 @@ static int test_inertia(void) {
     ret = zmk_input_processor_runtime_set_inertia_enabled(
         dev, true, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY);
     if (ret < 0 || zmk_input_processor_runtime_set_inertia_threshold(
-            dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY) != -EINVAL) {
+                       dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY) != -EINVAL) {
         return ret < 0 ? ret : -EINVAL;
     }
     ret = zmk_input_processor_runtime_set_inertia_threshold(
@@ -386,8 +384,7 @@ static int test_inertia(void) {
     }
     ret = zmk_input_processor_runtime_test_inertia_output_code(dev, &output_code);
     if (ret < 0 || output_code != INPUT_REL_HWHEEL) {
-        LOG_ERR("Automatic scroll output code: got %u expected %u", output_code,
-                INPUT_REL_HWHEEL);
+        LOG_ERR("Automatic scroll output code: got %u expected %u", output_code, INPUT_REL_HWHEEL);
         return ret < 0 ? ret : -EINVAL;
     }
     int16_t inertia_output;
@@ -408,20 +405,17 @@ static int test_inertia(void) {
     }
     /* The same measurement window now totals 34, increasing the speed. */
     if ((ret = process_test_relative_x(dev, 6, &output)) < 0 ||
-        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 ||
-        inertia_output != 7) {
+        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 || inertia_output != 7) {
         LOG_ERR("Inertia max output: got %d expected 7", inertia_output);
         return ret < 0 ? ret : -EINVAL;
     }
 
     /* With no new input, the retained speed decays across output intervals. */
-    if ((ret = inertia_tail_tick(dev, &inertia_output)) < 0 ||
-        inertia_output != 7) {
+    if ((ret = inertia_tail_tick(dev, &inertia_output)) < 0 || inertia_output != 7) {
         LOG_ERR("Inertia initial decay output: got %d expected 7", inertia_output);
         return ret < 0 ? ret : -EINVAL;
     }
-    if ((ret = inertia_tail_tick(dev, &inertia_output)) < 0 ||
-        inertia_output != 3) {
+    if ((ret = inertia_tail_tick(dev, &inertia_output)) < 0 || inertia_output != 3) {
         LOG_ERR("Inertia decayed output: got %d expected 3", inertia_output);
         return ret < 0 ? ret : -EINVAL;
     }
@@ -460,14 +454,10 @@ static int test_inertia(void) {
         (ret = process_test_relative_x(dev, 50, &output)) < 0) {
         return ret;
     }
-    if ((ret = inertia_tail_tick(dev, &inertia_output)) < 0 ||
-        inertia_output != 61 ||
-        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 ||
-        inertia_output != 61 ||
-        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 ||
-        inertia_output != 57 ||
-        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 ||
-        inertia_output != 56) {
+    if ((ret = inertia_tail_tick(dev, &inertia_output)) < 0 || inertia_output != 61 ||
+        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 || inertia_output != 61 ||
+        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 || inertia_output != 57 ||
+        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 || inertia_output != 56) {
         LOG_ERR("Inertia fractional decay: got %d expected 56", inertia_output);
         return ret < 0 ? ret : -EINVAL;
     }
@@ -519,8 +509,8 @@ static int test_inertia(void) {
     for (size_t i = 0; i < ARRAY_SIZE(exponential_tail); i++) {
         ret = inertia_tail_tick(dev, &inertia_output);
         if (ret < 0 || inertia_output != exponential_tail[i]) {
-            LOG_ERR("Exponential tail tick %u: got %d expected %d", (unsigned int)i,
-                    inertia_output, exponential_tail[i]);
+            LOG_ERR("Exponential tail tick %u: got %d expected %d", (unsigned int)i, inertia_output,
+                    exponential_tail[i]);
             return ret < 0 ? ret : -EINVAL;
         }
     }
@@ -544,17 +534,18 @@ static int test_inertia(void) {
      * including the carried fraction, cannot make another scroll count. */
     ret = zmk_input_processor_runtime_set_inertia_window(
         dev, 200, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY);
-    if (ret < 0 || (ret = zmk_input_processor_runtime_set_inertia_interval(
-                          dev, 20, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+    if (ret < 0 ||
+        (ret = zmk_input_processor_runtime_set_inertia_interval(
+             dev, 20, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
         (ret = zmk_input_processor_runtime_set_inertia_decay(
              dev, 50, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
         (ret = zmk_input_processor_runtime_set_inertia_threshold(
              dev, 1, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
         (ret = process_test_relative_x(dev, 1, &output)) < 0 ||
-        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 ||
-        inertia_output != 0 || !zmk_input_processor_runtime_test_inertia_active(dev) ||
-        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 ||
-        inertia_output != 0 || zmk_input_processor_runtime_test_inertia_active(dev) ||
+        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 || inertia_output != 0 ||
+        !zmk_input_processor_runtime_test_inertia_active(dev) ||
+        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 || inertia_output != 0 ||
+        zmk_input_processor_runtime_test_inertia_active(dev) ||
         last_inertia_stop_reason != ZMK_INPUT_PROCESSOR_INERTIA_STOP_REASON_SETTLED) {
         LOG_ERR("Sub-count inertia tail remained active");
         return ret < 0 ? ret : -EINVAL;
@@ -562,10 +553,11 @@ static int test_inertia(void) {
 
     /* Entry uses actual scaled reports; the synthetic tail uses raw speed
      * and carries the 1/60 scale remainder across output intervals. */
-    ret = zmk_input_processor_runtime_set_scaling(
-        dev, 1, 60, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY);
-    if (ret < 0 || (ret = zmk_input_processor_runtime_set_inertia_decay(
-                          dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+    ret = zmk_input_processor_runtime_set_scaling(dev, 1, 60,
+                                                  ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY);
+    if (ret < 0 ||
+        (ret = zmk_input_processor_runtime_set_inertia_decay(
+             dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
         (ret = zmk_input_processor_runtime_set_inertia_threshold(
              dev, 2, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0) {
         return ret;
@@ -612,8 +604,8 @@ static int test_inertia(void) {
         LOG_ERR("Zero-scale physical input was lost to inertia: total=%d", total);
         return -EINVAL;
     }
-    ret = zmk_input_processor_runtime_set_scaling(
-        dev, 1, 1, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY);
+    ret = zmk_input_processor_runtime_set_scaling(dev, 1, 1,
+                                                  ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY);
     if (ret < 0 || zmk_input_processor_runtime_test_inertia_active(dev) ||
         last_inertia_stop_reason != ZMK_INPUT_PROCESSOR_INERTIA_STOP_REASON_SETTINGS_CHANGED) {
         return ret < 0 ? ret : -EINVAL;
@@ -633,8 +625,8 @@ static int test_inertia(void) {
     }
     ret = zmk_keymap_layer_deactivate(1, false);
     if (ret < 0 || zmk_input_processor_runtime_test_inertia_active(dev) ||
-        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 ||
-        inertia_output != 0 || zmk_input_processor_runtime_test_inertia_active(dev)) {
+        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 || inertia_output != 0 ||
+        zmk_input_processor_runtime_test_inertia_active(dev)) {
         LOG_ERR("Inertia continued after targeted layer deactivation");
         return ret < 0 ? ret : -EINVAL;
     }
@@ -669,13 +661,11 @@ static int test_inertia(void) {
         zmk_input_processor_runtime_set_inertia_fast_output_percent(
             dev, 99, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY) != -EINVAL ||
         (ret = process_test_relative_x(dev, 11, &output)) < 0 ||
-        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 ||
-        inertia_output != 1 || last_inertia_fast_input ||
-        inertia_fast_input_transitions != fast_transitions_before + 1 ||
+        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 || inertia_output != 1 ||
+        last_inertia_fast_input || inertia_fast_input_transitions != fast_transitions_before + 1 ||
         (ret = process_test_relative_x(dev, 10, &output)) < 0 ||
-        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 ||
-        inertia_output != 8 || !last_inertia_fast_input ||
-        inertia_fast_input_transitions != fast_transitions_before + 2) {
+        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 || inertia_output != 8 ||
+        !last_inertia_fast_input || inertia_fast_input_transitions != fast_transitions_before + 2) {
         LOG_ERR("Fast inertia stage failed: output=%d", inertia_output);
         return ret < 0 ? ret : -EINVAL;
     }
@@ -689,11 +679,9 @@ static int test_inertia(void) {
         (ret = zmk_input_processor_runtime_set_inertia_fast_threshold(
              dev, 30, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
         (ret = process_test_relative_x(dev, 6, &output)) < 0 ||
-        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 ||
-        inertia_output != 2 ||
+        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 || inertia_output != 2 ||
         (ret = process_test_relative_x(dev, 9, &output)) < 0 ||
-        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 ||
-        inertia_output != 12) {
+        (ret = inertia_tail_tick(dev, &inertia_output)) < 0 || inertia_output != 12) {
         LOG_ERR("Scaled fast threshold failed: output=%d", inertia_output);
         return ret < 0 ? ret : -EINVAL;
     }
@@ -705,8 +693,7 @@ static int test_inertia(void) {
         return ret;
     }
     fast_transitions_before = inertia_fast_input_transitions;
-    if ((ret = process_test_relative_x(dev, 11, &output)) < 0 ||
-        !last_inertia_fast_input ||
+    if ((ret = process_test_relative_x(dev, 11, &output)) < 0 || !last_inertia_fast_input ||
         inertia_fast_input_transitions != fast_transitions_before + 1) {
         LOG_ERR("Fast input notification missing at inertia start");
         return ret < 0 ? ret : -EINVAL;
@@ -799,9 +786,8 @@ static int test_write_modes_and_save_discard(void) {
     // The tuned inertia defaults must survive unrelated writes.
     if (cfg.inertia_window_ms != 200 || cfg.inertia_interval_ms != 20 ||
         cfg.inertia_threshold != 12 || cfg.inertia_decay_percent != 8 ||
-        cfg.inertia_normal_max_output != 0 ||
-        !cfg.inertia_enabled || cfg.inertia_fast_threshold != 0 ||
-        cfg.inertia_fast_output_percent != 200 ||
+        cfg.inertia_normal_max_output != 0 || !cfg.inertia_enabled ||
+        cfg.inertia_fast_threshold != 0 || cfg.inertia_fast_output_percent != 200 ||
         cfg.inertia_notifications_enabled) {
         LOG_ERR("Unexpected inertia defaults: window=%u interval=%u threshold=%u decay=%u",
                 cfg.inertia_window_ms, cfg.inertia_interval_ms, cfg.inertia_threshold,
@@ -883,9 +869,8 @@ static int test_write_modes_and_save_discard(void) {
     zmk_input_processor_runtime_get_config(dev, NULL, &cfg);
     if (cfg.inertia_window_ms != 250 || cfg.inertia_interval_ms != 25 ||
         cfg.inertia_threshold != 23 || cfg.inertia_decay_percent != 7 ||
-        cfg.inertia_normal_max_output != 9 ||
-        cfg.inertia_fast_threshold != 48 || cfg.inertia_fast_output_percent != 250 ||
-        !cfg.inertia_notifications_enabled) {
+        cfg.inertia_normal_max_output != 9 || cfg.inertia_fast_threshold != 48 ||
+        cfg.inertia_fast_output_percent != 250 || !cfg.inertia_notifications_enabled) {
         LOG_ERR("Inertia discard did not restore flash value: window=%u interval=%u "
                 "threshold=%u decay=%u",
                 cfg.inertia_window_ms, cfg.inertia_interval_ms, cfg.inertia_threshold,
@@ -901,8 +886,7 @@ static int test_write_modes_and_save_discard(void) {
     if (cfg.rotation_degrees != 42 || cfg.inertia_window_ms != 250 ||
         cfg.inertia_interval_ms != 25 || cfg.inertia_threshold != 23 ||
         cfg.inertia_decay_percent != 7 || cfg.inertia_normal_max_output != 9 ||
-        cfg.inertia_fast_threshold != 48 ||
-        cfg.inertia_fast_output_percent != 250) {
+        cfg.inertia_fast_threshold != 48 || cfg.inertia_fast_output_percent != 250) {
         LOG_ERR("Legacy v1 settings were not migrated");
         return -EINVAL;
     }
@@ -935,6 +919,8 @@ static int test_write_modes_and_save_discard(void) {
     return 0;
 }
 
+#include "rip_review_cases.inc"
+
 static int rip_settings_test_init(void) {
     int ret = test_settings_backend_init();
     if (ret < 0) {
@@ -942,6 +928,9 @@ static int rip_settings_test_init(void) {
         return 0; // Never fail boot because of a test failure.
     }
 
+    if (test_review_persist_snapshot() < 0 || test_review_rpc_widths() < 0) {
+        return 0;
+    }
     ret = test_scaling_persists_across_reload();
     if (ret < 0) {
         LOG_ERR("FAIL: rip_settings_persist_reload ret=%d", ret);

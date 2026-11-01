@@ -1,0 +1,19 @@
+# Copyright (c) 2026 The ZMK Contributors
+# SPDX-License-Identifier: MIT
+
+description: |
+  Virtual input source for arbitrary runtime X/Y rotation. Collects a complete
+  relative frame and emits the rotated pair to a listener attached to this node.
+  Keep the referenced runtime processor in that listener's input-processors.
+
+compatible: "zmk,runtime-input-rotation"
+include: base.yaml
+properties:
+  device:
+    type: phandle
+    required: true
+    description: Physical or split input device to receive complete frames from
+  processor:
+    type: phandle
+    required: true
+    description: Runtime processor owning the angle and one relative X/Y code pair

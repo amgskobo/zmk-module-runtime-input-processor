@@ -1,115 +1,66 @@
 #!/usr/bin/env python3
-"""Hardware-free functional test: boot this module's firmware in the Renode
-emulator and exercise its own custom Studio RPC subsystem (`cormoran_rip`)
-end to end.
+"""Renode owner controls for the module's explicit Studio-over-UART fixture.
 
-How it's wired together (see README.md's "Hardware-free Renode testing"
-section for the full story):
-  - `ZMK_RENODE_ELF` (env var) points at the firmware ELF the action already
-    built with the Renode Studio-RPC-over-UART overlay + transport (real
-    hardware normally carries Studio RPC over USB; Renode's USB model is a
-    non-functional register stub, so testing under emulation swaps in a
-    wired-UART carrier with identical RPC framing -- see zmk-workspace's
-    skills/test-zmk-renode/SKILL.md for why).
-  - `renode_harness` (a module from that same zmk-workspace checkout) is
-    importable via PYTHONPATH -- the action sets this up. It provides
-    RenodeSession/boot_single/wait_for_text/proto compiling, so this file
-    doesn't need to reimplement any of the Renode-specific plumbing.
-  - The custom RPC "envelope": ZMK Studio's `zmk.custom` subsystem is a
-    generic pass-through -- a module's own proto messages travel as opaque
-    `bytes` inside `zmk.custom.CallRequest.payload`/`CallResponse.payload`,
-    addressed by a runtime-assigned `subsystem_index` (see dependencies'
-    zmk-studio-messages proto/zmk/custom.proto). This module registers
-    itself under the fixed string identifier "cormoran_rip"
-    (src/studio/custom_handler.c,
-    `ZMK_RPC_CUSTOM_SUBSYSTEM(cormoran_rip, ...)`), always as the first (and,
-    in the test build, only) registered subsystem, i.e. index 0.
+Build the ``renode_smoke_test`` artifact first, then run in the prepared
+container:
+    west zmk-renode-test tests/renode --elf /absolute/path/to/zmk.elf
 
-*** KNOWN RENODE-ENVIRONMENT LIMITATION (see zmk-module-template-with-
-custom-studio-rpc's and zmk-feature-fast-keymap's tests/renode/renode_test.py,
-found 2026-07-08; reproduced here 2026-07-09 with a twist specific to this
-module -- see below) ***
-Under Renode -- and, as far as we know, ONLY under Renode -- the Studio RPC
-TX path can stall and stop delivering frames once enough data (or enough
-separate messages) goes out back-to-back over the emulated UART. The
-template and fast-keymap found this triggered by a single callback-encoded
-custom-subsystem *response* past a few tens of bytes. During the hang the
-firmware is NOT crashed: Renode's `sysbus.cpu ExecutedInstructions` keeps
-growing steadily and `sysbus.cpu PC` samples land inside
-`ring_buf_area_claim`/`ring_buf_area_finish`
-(dependencies/zephyr/lib/utils/ring_buffer.c), consistent with the TX path
-waiting on a ring buffer that never drains -- see the template's
-tests/renode/renode_test.py module docstring for the full investigation. It
-does not affect real hardware.
+The selected zmk-west-commands helper provides the Renode platform and harness.
+Its ``boot_single_real`` connects the console and UART1 sockets; this fixture's
+renode-studio-uart snippet deliberately enables that UART carrier. The generic
+BLE smoke checks boot liveness without a host ELF. The owner cases separately
+assert an invalid-subsystem envelope and a real GetLayerInfo custom RPC reply.
 
-Empirically confirmed for this module's own RPC surface (2026-07-09, against
-the test build's 3 configured input processors and its single, unnamed
-keymap layer):
-  - `GetLayerInfoRequest` round-trips reliably: its response carries real
-    per-layer data, but the test keymap has exactly one layer with no
-    explicit display name, so the encoded response stays tiny (well under
-    the observed threshold) -- this is the real custom-subsystem round trip
-    this file asserts (test_custom_rpc_get_layer_info_round_trip).
-  - `ListInputProcessorsRequest`, despite its own RPC *response* being
-    deliberately empty by design (handle_list_input_processors() in
-    src/studio/custom_handler.c reports the real processor data out-of-band,
-    as `InputProcessorChangedNotification`s per processor, instead of in the
-    response -- see proto/cormoran/rip/custom.proto), reliably times out
-    under Renode: it makes the firmware enqueue one
-    callback-encoded notification (each carrying a full, ~15-field
-    `InputProcessorInfo`) per configured processor (3 in the test build)
-    over the same custom-subsystem response-encoding machinery, back to
-    back, before/around the small RPC response itself -- reproducing the
-    same TX-path stall from cumulative traffic rather than from a single
-    large message. Small, callback-free responses (core GetDeviceInfo,
-    meta.simple_error) are unaffected by either pattern and stay reliable
-    indefinitely.
+The third case retains the known ListInputProcessors UART response timeout.
+It is an explicit emulation limitation, not successful list delivery. If a reply
+starts arriving, that assertion must fail so the case can be replaced with
+positive response and notification checks. Native fixtures separately exercise
+the processor/persistence/handler paths; neither proves physical transport.
 
-Run locally (from this repo's root, with a west workspace already set up --
-see README.md):
-
-    python3 tests/renode/renode_test.py -v
-
-(Named `renode_test.py`, not `test_renode.py`, on purpose: the existing
-`python3 -m unittest -v` build-job step at the repo root auto-discovers
-every `test*.py`, and this file needs a real firmware ELF + PYTHONPATH the
-build job doesn't set up -- keeping it out of that pattern keeps the two
-test surfaces independent. The `zmk-renode-test` action instead runs
-everything under `tests/renode/` explicitly, with `ZMK_RENODE_ELF` and
-PYTHONPATH already set.)
-
-The Renode-testable ELF must already be built first -- see README.md for
-the exact build invocation, or let the composite action / CI do it.
+Helper and Studio schema paths come from the actual selected West projects in
+both parent and isolated layouts. There is no recursive or sibling fallback.
+The fixture registers cormoran_rip as its sole custom RPC subsystem (index 0).
+``renode_test.py`` is intentionally separate from ordinary unittest discovery;
+the West Renode entry supplies the exact ELF and emulator setup.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import subprocess
 import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# renode_harness comes from the zmk-workspace checkout the zmk-renode-test
-# action provides on PYTHONPATH (zmk-workspace is no longer a west dependency
-# -- the buildable renode module/snippet now come from zmk-west-commands).
-# Support running this file directly too by falling back to a sibling
-# `zmk-workspace` checkout next to this repo.
+
+def selected_west_project(name: str) -> Path:
+    result = subprocess.run(
+        ["west", "list", name, "-f", "{abspath}"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    paths = result.stdout.strip().splitlines()
+    if len(paths) != 1 or not Path(paths[0]).is_absolute():
+        raise RuntimeError("West must select exactly one absolute project: " + name)
+    project = Path(paths[0]).resolve(strict=True)
+    if not project.is_dir():
+        raise RuntimeError("Selected West project is not a directory: " + name)
+    return project
+
+
+# Direct execution selects the same declared helper as the canonical West entry.
 try:
     import renode_harness
-except ImportError:  # pragma: no cover - convenience fallback for local dev
-    fallback_candidates = [
-        REPO_ROOT.parent / "zmk-workspace" / "skills" / "test-zmk-renode" / "scripts",
-    ]
-    for fallback in fallback_candidates:
-        if fallback.is_dir():
-            sys.path.insert(0, str(fallback))
-            import renode_harness
-
-            break
-    else:
-        raise
+except ImportError:
+    helper = selected_west_project("zmk-west-commands")
+    if not (helper / "scripts/lib/renode/renode_harness.py").is_file():
+        raise RuntimeError("Selected zmk-west-commands has no Renode harness")
+    sys.path.insert(0, str(helper / "scripts/lib/renode"))
+    import renode_harness
 
 
 SUBSYSTEM_IDENTIFIER = "cormoran_rip"
@@ -155,7 +106,10 @@ class RenodeRuntimeInputProcessorTests(unittest.TestCase):
 
         # Core zmk.studio.* messages (Request/Response envelope, core.proto,
         # custom.proto for the generic custom-subsystem envelope).
-        studio_proto_dir = renode_harness.find_studio_proto_dir(REPO_ROOT)
+        studio_proto_dir = selected_west_project("zmk-studio-messages") / "proto/zmk"
+        for filename in ("studio.proto", "custom.proto"):
+            if not (studio_proto_dir / filename).is_file():
+                raise RuntimeError("Selected Studio schema is missing " + filename)
         cls.studio_pb2 = renode_harness.load_studio_pb2(studio_proto_dir)
 
         # This module's own proto (proto/cormoran/rip/custom.proto, package
@@ -171,7 +125,7 @@ class RenodeRuntimeInputProcessorTests(unittest.TestCase):
         cls.rip_pb2 = rip_pb2
 
     def setUp(self):
-        self.session, self.console, self.rpc = renode_harness.boot_single(
+        self.session, self.console, self.rpc = renode_harness.boot_single_real(
             self.renode_path, self.elf
         )
         self.addCleanup(self.session.stop)

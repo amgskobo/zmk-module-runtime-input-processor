@@ -11,6 +11,7 @@
 #include <zephyr/logging/log.h>
 #include <zmk/pointing/input_processor_runtime.h>
 #include <zmk/behavior.h>
+#include "../pointing/runtime_input_override.h"
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
@@ -23,7 +24,6 @@ struct behavior_input_processor_temp_config_config {
 
 struct behavior_input_processor_temp_config_data {
     const struct device *processor;
-    bool is_active;
 };
 
 static int behavior_input_processor_temp_config_init(const struct device *dev) {
@@ -37,7 +37,6 @@ static int behavior_input_processor_temp_config_init(const struct device *dev) {
         return -ENODEV;
     }
 
-    data->is_active = false;
     LOG_DBG("Temporary config behavior initialized for processor: %s", cfg->processor_name);
     return 0;
 }
@@ -52,32 +51,21 @@ static int on_keymap_binding_pressed(struct zmk_behavior_binding *binding,
         return -ENODEV;
     }
 
-    // Apply temporary configuration (non-persistent)
-    int ret = 0;
+    struct runtime_override_values values = {.multiplier = cfg->scale_multiplier,
+                                             .divisor = cfg->scale_divisor,
+                                             .rotation = cfg->rotation_degrees};
+    uint8_t fields = 0;
     if (cfg->scale_multiplier > 0 && cfg->scale_divisor > 0) {
-        ret = zmk_input_processor_runtime_set_scaling(
-            data->processor, cfg->scale_multiplier, cfg->scale_divisor,
-            ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY);
-        if (ret < 0) {
-            LOG_ERR("Failed to set temporary scaling: %d", ret);
-            return ret;
-        }
+        fields |= RUNTIME_OVERRIDE_SCALE;
     }
-
-    // Update rotation if provided and valid (non-persistent)
-    if (cfg->rotation_degrees >= -360 && cfg->rotation_degrees <= 360) {
-        ret = zmk_input_processor_runtime_set_rotation(
-            data->processor, cfg->rotation_degrees,
-            ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY);
-        if (ret < 0) {
-            LOG_ERR("Failed to set temporary rotation: %d", ret);
-            return ret;
-        }
+    /* The binding documents zero as "leave rotation unchanged". */
+    if (cfg->rotation_degrees != 0) {
+        fields |= RUNTIME_OVERRIDE_ROTATION;
     }
-
-    data->is_active = true;
-    LOG_INF("Applied temporary config to %s: scale=%d/%d, rotation=%d", cfg->processor_name,
-            cfg->scale_multiplier, cfg->scale_divisor, cfg->rotation_degrees);
+    int ret = runtime_override_press(data->processor, dev, event.position, fields, &values);
+    if (ret < 0) {
+        return ret;
+    }
 
     return ZMK_BEHAVIOR_OPAQUE;
 }
@@ -85,18 +73,7 @@ static int on_keymap_binding_pressed(struct zmk_behavior_binding *binding,
 static int on_keymap_binding_released(struct zmk_behavior_binding *binding,
                                       struct zmk_behavior_binding_event event) {
     const struct device *dev = zmk_behavior_get_binding(binding->behavior_dev);
-    struct behavior_input_processor_temp_config_data *data = dev->data;
-    const struct behavior_input_processor_temp_config_config *cfg = dev->config;
-
-    if (!data->processor || !data->is_active) {
-        return 0;
-    }
-
-    // Restore persistent configuration
-    zmk_input_processor_runtime_restore_persistent(data->processor);
-
-    data->is_active = false;
-    LOG_INF("Restored persistent config for %s", cfg->processor_name);
+    runtime_override_release(dev, event.position);
 
     return ZMK_BEHAVIOR_OPAQUE;
 }

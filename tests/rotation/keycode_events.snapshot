@@ -1,0 +1,6 @@
+PASS: runtime_rotation_frames
+PASS: runtime_rotation_arbitrary_angles
+PASS: runtime_rotation_independent_sources
+PASS: runtime_rotation_buttons_and_scroll
+PASS: runtime_rotation_oversized_recovery
+PASS: runtime_rotation_queue_recovery
