@@ -14,6 +14,7 @@
 #include <zmk/keymap.h>
 #include <zmk/pointing/input_processor_runtime.h>
 #include <zmk/studio/custom.h>
+#include <zmk/studio/core.h>
 #include <zmk/workqueue.h>
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
@@ -25,6 +26,8 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 static struct zmk_rpc_custom_subsystem_meta rip_feature_meta = {
     ZMK_RPC_CUSTOM_SUBSYSTEM_UI_URLS(
         "https://cormoran.github.io/zmk-module-runtime-input-processor/"),
+    /* Read-only requests remain available while locked; mutations are gated
+     * after decoding their discriminator below. */
     .security = ZMK_STUDIO_RPC_HANDLER_UNSECURED,
 };
 
@@ -39,14 +42,20 @@ ZMK_RPC_CUSTOM_SUBSYSTEM_RESPONSE_BUFFER(cormoran_rip, cormoran_rip_Response);
 /* Map the proto write mode onto the firmware write mode. An unset field decodes
  * to WRITE_MODE_PERSIST (proto3 default 0), preserving the historical
  * always-persist behavior for older clients. */
-static enum zmk_input_processor_runtime_write_mode rip_write_mode(cormoran_rip_WriteMode mode) {
+static int rip_write_mode(cormoran_rip_WriteMode mode,
+                          enum zmk_input_processor_runtime_write_mode *write_mode) {
     switch (mode) {
+    case cormoran_rip_WriteMode_WRITE_MODE_PERSIST:
+        *write_mode = ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_PERSIST;
+        return 0;
     case cormoran_rip_WriteMode_WRITE_MODE_MEMORY:
-        return ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY;
+        *write_mode = ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY;
+        return 0;
     case cormoran_rip_WriteMode_WRITE_MODE_TEMPORARY:
-        return ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY;
+        *write_mode = ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY;
+        return 0;
     default:
-        return ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_PERSIST;
+        return -EINVAL;
     }
 }
 
@@ -136,6 +145,17 @@ static bool rip_rpc_handle_request(const zmk_custom_CallRequest *raw_request,
         snprintf(err.message, sizeof(err.message), "Failed to decode request");
         resp->which_response_type = cormoran_rip_Response_error_tag;
         resp->response_type.error = err;
+        return true;
+    }
+
+    const bool read_only =
+        req.which_request_type == cormoran_rip_Request_list_input_processors_tag ||
+        req.which_request_type == cormoran_rip_Request_get_input_processor_tag ||
+        req.which_request_type == cormoran_rip_Request_get_layer_info_tag;
+    if (!read_only && zmk_studio_core_get_lock_state() != ZMK_STUDIO_CORE_LOCK_STATE_UNLOCKED) {
+        resp->which_response_type = cormoran_rip_Response_error_tag;
+        snprintf(resp->response_type.error.message, sizeof(resp->response_type.error.message),
+                 "Studio unlock required");
         return true;
     }
 
@@ -374,6 +394,11 @@ static int handle_get_input_processor(const cormoran_rip_GetInputProcessorReques
  */
 static int handle_set_scale_multiplier(const cormoran_rip_SetScaleMultiplierRequest *req,
                                        cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     LOG_DBG("Setting scale multiplier for id=%d to %d", req->id, req->value);
 
     const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
@@ -390,8 +415,7 @@ static int handle_set_scale_multiplier(const cormoran_rip_SetScaleMultiplierRequ
     }
 
     // Set new multiplier (write mode per request)
-    ret = zmk_input_processor_runtime_set_scaling(dev, req->value, config.scale_divisor,
-                                                  rip_write_mode(req->write_mode));
+    ret = zmk_input_processor_runtime_set_scaling(dev, req->value, config.scale_divisor, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set scale multiplier: %d", ret);
         return ret;
@@ -410,6 +434,11 @@ static int handle_set_scale_multiplier(const cormoran_rip_SetScaleMultiplierRequ
  */
 static int handle_set_scale_divisor(const cormoran_rip_SetScaleDivisorRequest *req,
                                     cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     LOG_DBG("Setting scale divisor for id=%d to %d", req->id, req->value);
 
     const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
@@ -426,8 +455,7 @@ static int handle_set_scale_divisor(const cormoran_rip_SetScaleDivisorRequest *r
     }
 
     // Set new divisor (write mode per request)
-    ret = zmk_input_processor_runtime_set_scaling(dev, config.scale_multiplier, req->value,
-                                                  rip_write_mode(req->write_mode));
+    ret = zmk_input_processor_runtime_set_scaling(dev, config.scale_multiplier, req->value, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set scale divisor: %d", ret);
         return ret;
@@ -446,6 +474,11 @@ static int handle_set_scale_divisor(const cormoran_rip_SetScaleDivisorRequest *r
  */
 static int handle_set_rotation(const cormoran_rip_SetRotationRequest *req,
                                cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     LOG_DBG("Setting rotation for id=%d to %d degrees", req->id, req->value);
 
     const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
@@ -455,8 +488,7 @@ static int handle_set_rotation(const cormoran_rip_SetRotationRequest *req,
     }
 
     // Set rotation (write mode per request)
-    int ret =
-        zmk_input_processor_runtime_set_rotation(dev, req->value, rip_write_mode(req->write_mode));
+    int ret = zmk_input_processor_runtime_set_rotation(dev, req->value, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set rotation: %d", ret);
         return ret;
@@ -503,6 +535,11 @@ static int handle_reset_input_processor(const cormoran_rip_ResetInputProcessorRe
  */
 static int handle_set_temp_layer_enabled(const cormoran_rip_SetTempLayerEnabledRequest *req,
                                          cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     LOG_DBG("Setting temp-layer enabled for id=%d to %d", req->id, req->enabled);
 
     const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
@@ -512,8 +549,7 @@ static int handle_set_temp_layer_enabled(const cormoran_rip_SetTempLayerEnabledR
     }
 
     // Set temp-layer enabled (write mode per request)
-    int ret = zmk_input_processor_runtime_set_temp_layer_enabled(dev, req->enabled,
-                                                                 rip_write_mode(req->write_mode));
+    int ret = zmk_input_processor_runtime_set_temp_layer_enabled(dev, req->enabled, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set temp-layer enabled: %d", ret);
         return ret;
@@ -532,6 +568,11 @@ static int handle_set_temp_layer_enabled(const cormoran_rip_SetTempLayerEnabledR
  */
 static int handle_set_temp_layer_layer(const cormoran_rip_SetTempLayerLayerRequest *req,
                                        cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     LOG_DBG("Setting temp-layer layer for id=%d to %d", req->id, req->layer);
 
     const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
@@ -541,8 +582,7 @@ static int handle_set_temp_layer_layer(const cormoran_rip_SetTempLayerLayerReque
     }
 
     // Set temp-layer layer (write mode per request)
-    int ret = zmk_input_processor_runtime_set_temp_layer_layer(dev, req->layer,
-                                                               rip_write_mode(req->write_mode));
+    int ret = zmk_input_processor_runtime_set_temp_layer_layer(dev, req->layer, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set temp-layer layer: %d", ret);
         return ret;
@@ -562,6 +602,11 @@ static int handle_set_temp_layer_layer(const cormoran_rip_SetTempLayerLayerReque
 static int
 handle_set_temp_layer_activation_delay(const cormoran_rip_SetTempLayerActivationDelayRequest *req,
                                        cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     LOG_DBG("Setting temp-layer activation delay for id=%d to %dms", req->id,
             req->activation_delay_ms);
 
@@ -573,7 +618,7 @@ handle_set_temp_layer_activation_delay(const cormoran_rip_SetTempLayerActivation
 
     // Set temp-layer activation delay (write mode per request)
     int ret = zmk_input_processor_runtime_set_temp_layer_activation_delay(
-        dev, req->activation_delay_ms, rip_write_mode(req->write_mode));
+        dev, req->activation_delay_ms, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set temp-layer activation delay: %d", ret);
         return ret;
@@ -593,6 +638,11 @@ handle_set_temp_layer_activation_delay(const cormoran_rip_SetTempLayerActivation
  */
 static int handle_set_temp_layer_deactivation_delay(
     const cormoran_rip_SetTempLayerDeactivationDelayRequest *req, cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     LOG_DBG("Setting temp-layer deactivation delay for id=%d to %dms", req->id,
             req->deactivation_delay_ms);
 
@@ -604,7 +654,7 @@ static int handle_set_temp_layer_deactivation_delay(
 
     // Set temp-layer deactivation delay (write mode per request)
     int ret = zmk_input_processor_runtime_set_temp_layer_deactivation_delay(
-        dev, req->deactivation_delay_ms, rip_write_mode(req->write_mode));
+        dev, req->deactivation_delay_ms, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set temp-layer deactivation delay: %d", ret);
         return ret;
@@ -624,6 +674,11 @@ static int handle_set_temp_layer_deactivation_delay(
  */
 static int handle_set_active_layers(const cormoran_rip_SetActiveLayersRequest *req,
                                     cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     LOG_DBG("Setting active layers for id=%d to 0x%08x", req->id, req->layers);
 
     const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
@@ -633,8 +688,7 @@ static int handle_set_active_layers(const cormoran_rip_SetActiveLayersRequest *r
     }
 
     // Set active layers (write mode per request)
-    int ret = zmk_input_processor_runtime_set_active_layers(dev, req->layers,
-                                                            rip_write_mode(req->write_mode));
+    int ret = zmk_input_processor_runtime_set_active_layers(dev, req->layers, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set active layers: %d", ret);
         return ret;
@@ -653,6 +707,11 @@ static int handle_set_active_layers(const cormoran_rip_SetActiveLayersRequest *r
  */
 static int handle_set_axis_snap_mode(const cormoran_rip_SetAxisSnapModeRequest *req,
                                      cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     LOG_DBG("Setting axis snap mode for id=%d to %d", req->id, req->mode);
 
     const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
@@ -662,8 +721,7 @@ static int handle_set_axis_snap_mode(const cormoran_rip_SetAxisSnapModeRequest *
     }
 
     // Set axis snap mode (write mode per request)
-    int ret = zmk_input_processor_runtime_set_axis_snap_mode(dev, req->mode,
-                                                             rip_write_mode(req->write_mode));
+    int ret = zmk_input_processor_runtime_set_axis_snap_mode(dev, req->mode, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set axis snap mode: %d", ret);
         return ret;
@@ -682,6 +740,11 @@ static int handle_set_axis_snap_mode(const cormoran_rip_SetAxisSnapModeRequest *
  */
 static int handle_set_axis_snap_threshold(const cormoran_rip_SetAxisSnapThresholdRequest *req,
                                           cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     LOG_DBG("Setting axis snap threshold for id=%d to %d", req->id, req->threshold);
 
     const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
@@ -691,8 +754,7 @@ static int handle_set_axis_snap_threshold(const cormoran_rip_SetAxisSnapThreshol
     }
 
     // Set axis snap threshold (write mode per request)
-    int ret = zmk_input_processor_runtime_set_axis_snap_threshold(dev, req->threshold,
-                                                                  rip_write_mode(req->write_mode));
+    int ret = zmk_input_processor_runtime_set_axis_snap_threshold(dev, req->threshold, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set axis snap threshold: %d", ret);
         return ret;
@@ -711,6 +773,11 @@ static int handle_set_axis_snap_threshold(const cormoran_rip_SetAxisSnapThreshol
  */
 static int handle_set_axis_snap_timeout(const cormoran_rip_SetAxisSnapTimeoutRequest *req,
                                         cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     LOG_DBG("Setting axis snap timeout for id=%d to %d ms", req->id, req->timeout_ms);
 
     const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
@@ -720,8 +787,7 @@ static int handle_set_axis_snap_timeout(const cormoran_rip_SetAxisSnapTimeoutReq
     }
 
     // Set axis snap timeout (write mode per request)
-    int ret = zmk_input_processor_runtime_set_axis_snap_timeout(dev, req->timeout_ms,
-                                                                rip_write_mode(req->write_mode));
+    int ret = zmk_input_processor_runtime_set_axis_snap_timeout(dev, req->timeout_ms, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set axis snap timeout: %d", ret);
         return ret;
@@ -740,6 +806,11 @@ static int handle_set_axis_snap_timeout(const cormoran_rip_SetAxisSnapTimeoutReq
  */
 static int handle_set_x_invert(const cormoran_rip_SetXInvertRequest *req,
                                cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     LOG_DBG("Setting X invert for id=%d to %s", req->id, req->invert ? "true" : "false");
 
     const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
@@ -749,8 +820,7 @@ static int handle_set_x_invert(const cormoran_rip_SetXInvertRequest *req,
     }
 
     // Set X invert (write mode per request)
-    int ret =
-        zmk_input_processor_runtime_set_x_invert(dev, req->invert, rip_write_mode(req->write_mode));
+    int ret = zmk_input_processor_runtime_set_x_invert(dev, req->invert, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set X invert: %d", ret);
         return ret;
@@ -769,6 +839,11 @@ static int handle_set_x_invert(const cormoran_rip_SetXInvertRequest *req,
  */
 static int handle_set_y_invert(const cormoran_rip_SetYInvertRequest *req,
                                cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     LOG_DBG("Setting Y invert for id=%d to %s", req->id, req->invert ? "true" : "false");
 
     const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
@@ -778,8 +853,7 @@ static int handle_set_y_invert(const cormoran_rip_SetYInvertRequest *req,
     }
 
     // Set Y invert (write mode per request)
-    int ret =
-        zmk_input_processor_runtime_set_y_invert(dev, req->invert, rip_write_mode(req->write_mode));
+    int ret = zmk_input_processor_runtime_set_y_invert(dev, req->invert, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set Y invert: %d", ret);
         return ret;
@@ -796,6 +870,11 @@ static int handle_set_y_invert(const cormoran_rip_SetYInvertRequest *req,
 /** Handle setting inertia interval. */
 static int handle_set_inertia_interval(const cormoran_rip_SetInertiaIntervalRequest *req,
                                        cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     if (req->interval_ms == 0 || req->interval_ms > 60000U) {
         return -EINVAL;
     }
@@ -805,8 +884,7 @@ static int handle_set_inertia_interval(const cormoran_rip_SetInertiaIntervalRequ
         return -ENODEV;
     }
 
-    int ret = zmk_input_processor_runtime_set_inertia_interval(dev, req->interval_ms,
-                                                               rip_write_mode(req->write_mode));
+    int ret = zmk_input_processor_runtime_set_inertia_interval(dev, req->interval_ms, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set inertia interval: %d", ret);
         return ret;
@@ -821,6 +899,11 @@ static int handle_set_inertia_interval(const cormoran_rip_SetInertiaIntervalRequ
 /** Handle setting inertia measurement window. */
 static int handle_set_inertia_window(const cormoran_rip_SetInertiaWindowRequest *req,
                                      cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     if (req->window_ms == 0 || req->window_ms > 60000U) {
         return -EINVAL;
     }
@@ -830,8 +913,7 @@ static int handle_set_inertia_window(const cormoran_rip_SetInertiaWindowRequest 
         return -ENODEV;
     }
 
-    int ret = zmk_input_processor_runtime_set_inertia_window(dev, req->window_ms,
-                                                             rip_write_mode(req->write_mode));
+    int ret = zmk_input_processor_runtime_set_inertia_window(dev, req->window_ms, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set inertia window: %d", ret);
         return ret;
@@ -846,6 +928,11 @@ static int handle_set_inertia_window(const cormoran_rip_SetInertiaWindowRequest 
 /** Handle setting inertia threshold. */
 static int handle_set_inertia_threshold(const cormoran_rip_SetInertiaThresholdRequest *req,
                                         cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     if (req->threshold == 0 || req->threshold > 65535U) {
         LOG_WRN("Inertia threshold out of range: %u", req->threshold);
         return -EINVAL;
@@ -857,8 +944,8 @@ static int handle_set_inertia_threshold(const cormoran_rip_SetInertiaThresholdRe
         return -ENODEV;
     }
 
-    int ret = zmk_input_processor_runtime_set_inertia_threshold(dev, (uint16_t)req->threshold,
-                                                                rip_write_mode(req->write_mode));
+    int ret =
+        zmk_input_processor_runtime_set_inertia_threshold(dev, (uint16_t)req->threshold, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set inertia threshold: %d", ret);
         return ret;
@@ -872,12 +959,16 @@ static int handle_set_inertia_threshold(const cormoran_rip_SetInertiaThresholdRe
 
 static int handle_set_inertia_enabled(const cormoran_rip_SetInertiaEnabledRequest *req,
                                       cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
     if (!dev) {
         return -ENODEV;
     }
-    int ret = zmk_input_processor_runtime_set_inertia_enabled(dev, req->enabled,
-                                                              rip_write_mode(req->write_mode));
+    int ret = zmk_input_processor_runtime_set_inertia_enabled(dev, req->enabled, mode);
     if (ret < 0) {
         return ret;
     }
@@ -890,6 +981,11 @@ static int handle_set_inertia_enabled(const cormoran_rip_SetInertiaEnabledReques
 /** Handle setting inertia decay per output interval. */
 static int handle_set_inertia_decay(const cormoran_rip_SetInertiaDecayRequest *req,
                                     cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     if (req->decay_percent > 100U) {
         LOG_WRN("Inertia decay out of range: %u", req->decay_percent);
         return -EINVAL;
@@ -900,8 +996,7 @@ static int handle_set_inertia_decay(const cormoran_rip_SetInertiaDecayRequest *r
         return -ENODEV;
     }
 
-    int ret = zmk_input_processor_runtime_set_inertia_decay(dev, (uint8_t)req->decay_percent,
-                                                            rip_write_mode(req->write_mode));
+    int ret = zmk_input_processor_runtime_set_inertia_decay(dev, (uint8_t)req->decay_percent, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set inertia decay: %d", ret);
         return ret;
@@ -916,6 +1011,11 @@ static int handle_set_inertia_decay(const cormoran_rip_SetInertiaDecayRequest *r
 static int
 handle_set_inertia_normal_max_output(const cormoran_rip_SetInertiaNormalMaxOutputRequest *req,
                                      cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     if (req->max_output > INT16_MAX) {
         return -EINVAL;
     }
@@ -924,7 +1024,7 @@ handle_set_inertia_normal_max_output(const cormoran_rip_SetInertiaNormalMaxOutpu
         return -ENODEV;
     }
     int ret = zmk_input_processor_runtime_set_inertia_normal_max_output(
-        dev, (uint16_t)req->max_output, rip_write_mode(req->write_mode));
+        dev, (uint16_t)req->max_output, mode);
     if (ret < 0) {
         return ret;
     }
@@ -937,6 +1037,11 @@ handle_set_inertia_normal_max_output(const cormoran_rip_SetInertiaNormalMaxOutpu
 
 static int handle_set_inertia_fast_threshold(const cormoran_rip_SetInertiaFastThresholdRequest *req,
                                              cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     if (req->threshold > UINT16_MAX) {
         return -EINVAL;
     }
@@ -944,8 +1049,8 @@ static int handle_set_inertia_fast_threshold(const cormoran_rip_SetInertiaFastTh
     if (!dev) {
         return -ENODEV;
     }
-    int ret = zmk_input_processor_runtime_set_inertia_fast_threshold(
-        dev, (uint16_t)req->threshold, rip_write_mode(req->write_mode));
+    int ret =
+        zmk_input_processor_runtime_set_inertia_fast_threshold(dev, (uint16_t)req->threshold, mode);
     if (ret < 0) {
         return ret;
     }
@@ -958,6 +1063,11 @@ static int handle_set_inertia_fast_threshold(const cormoran_rip_SetInertiaFastTh
 static int
 handle_set_inertia_fast_output_percent(const cormoran_rip_SetInertiaFastOutputPercentRequest *req,
                                        cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     if (req->percent < 100 || req->percent > 1000) {
         return -EINVAL;
     }
@@ -966,7 +1076,7 @@ handle_set_inertia_fast_output_percent(const cormoran_rip_SetInertiaFastOutputPe
         return -ENODEV;
     }
     int ret = zmk_input_processor_runtime_set_inertia_fast_output_percent(
-        dev, (uint16_t)req->percent, rip_write_mode(req->write_mode));
+        dev, (uint16_t)req->percent, mode);
     if (ret < 0) {
         return ret;
     }
@@ -1052,6 +1162,11 @@ static int handle_get_layer_info(const cormoran_rip_GetLayerInfoRequest *req,
  */
 static int handle_set_xy_to_scroll_enabled(const cormoran_rip_SetXyToScrollEnabledRequest *req,
                                            cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     LOG_DBG("Setting XY-to-scroll enabled for id=%d to %d", req->id, req->enabled);
 
     const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
@@ -1061,8 +1176,7 @@ static int handle_set_xy_to_scroll_enabled(const cormoran_rip_SetXyToScrollEnabl
     }
 
     // Set XY-to-scroll enabled (write mode per request)
-    int ret = zmk_input_processor_runtime_set_xy_to_scroll_enabled(dev, req->enabled,
-                                                                   rip_write_mode(req->write_mode));
+    int ret = zmk_input_processor_runtime_set_xy_to_scroll_enabled(dev, req->enabled, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set XY-to-scroll enabled: %d", ret);
         return ret;
@@ -1081,6 +1195,11 @@ static int handle_set_xy_to_scroll_enabled(const cormoran_rip_SetXyToScrollEnabl
  */
 static int handle_set_xy_swap_enabled(const cormoran_rip_SetXySwapEnabledRequest *req,
                                       cormoran_rip_Response *resp) {
+    enum zmk_input_processor_runtime_write_mode mode;
+    if (rip_write_mode(req->write_mode, &mode) < 0) {
+        return -EINVAL;
+    }
+
     LOG_DBG("Setting XY-swap enabled for id=%d to %d", req->id, req->enabled);
 
     const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
@@ -1090,8 +1209,7 @@ static int handle_set_xy_swap_enabled(const cormoran_rip_SetXySwapEnabledRequest
     }
 
     // Set XY-swap enabled (write mode per request)
-    int ret = zmk_input_processor_runtime_set_xy_swap_enabled(dev, req->enabled,
-                                                              rip_write_mode(req->write_mode));
+    int ret = zmk_input_processor_runtime_set_xy_swap_enabled(dev, req->enabled, mode);
     if (ret < 0) {
         LOG_ERR("Failed to set XY-swap enabled: %d", ret);
         return ret;

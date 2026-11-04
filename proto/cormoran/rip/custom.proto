@@ -84,7 +84,7 @@ message GetLayerInfoResponse {
 }
 
 message SetScaleMultiplierRequest {
-    uint32 id = 1;             // ID of the input processor to update
+    uint32 id = 1;            // ID of the input processor to update
     uint32 value = 2;         // New scaling multiplier
     WriteMode write_mode = 3; // Where to store the value (default: persist)
 }

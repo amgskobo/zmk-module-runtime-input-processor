@@ -69,8 +69,8 @@ storage and avoids 15×N registration boilerplate.
   module's own Studio RPC remains the intended editing surface: there is
   deliberately no `zmk_custom_setting_changed` listener re-applying generic writes
   to the device (see the load path below), so the generic surface is for
-  visibility/inspection, and a generic write only takes effect after a reboot's
-  boot-apply and only if it is a valid version/size blob.
+  visibility/inspection. A permitted generic write takes effect through boot
+  apply or this module's explicit Discard All, only for a valid version/size blob.
 - Default value: an empty (zero-length) `ZMK_CUSTOM_SETTING_VALUE_BYTES()`, meaning
   "nothing persisted → keep DT defaults".
 - Size: the blob is `1 + sizeof(struct rip_persist_v1)` (~40 bytes for the 15
@@ -157,9 +157,36 @@ plus a one-shot settings→device boot apply is sufficient and matches the "stor
 backend only" decision. (This is the deliberate difference from pmw3610/animation,
 which use custom-settings as their editing surface and therefore need the listener.)
 
-Because `DEVICE_PRIVATE` entries are not reachable by the generic RPC, generic
-save/discard/reset cannot touch them, so nothing external mutates them behind the
-module's back — reinforcing that no listener is needed.
+The entries are `RPC_PUBLIC`, with an unsecure read permission and a secure write
+permission. Generic RPC writes, resets and other mutations therefore require an
+unlocked Studio session. A permitted generic write changes the registry's stored
+blob, not the live processor; boot apply or this module's explicit Discard All
+can consume a valid blob. This visibility does not change Design A or justify a
+changed-event reapply listener. The module's own List, Get and layer-info requests
+remain available while Studio is locked; every other request requires unlock.
+
+### Current frame and persistence synchronization
+
+Runtime-pipeline frames, configuration operations and state workers share one
+recursive guard. The complete pipeline holds it across all processor stages,
+while source input callbacks only enqueue work. Individual operations serialize;
+several independent setters or processors in Save/Discard All are not one
+transaction.
+
+A PERSIST setter captures the baseline into its pending save buffer under that
+guard and a short per-processor snapshot lock. The save worker copies the buffer
+under the snapshot lock, then performs Custom Settings/backend I/O without the
+frame guard. Save All follows the same copy-then-I/O boundary. A separate
+per-processor I/O lock orders those saves with Discard All, which reads the
+registry before taking the frame guard to apply a valid blob. No frame-guard
+holder waits for that I/O lock or a settings backend. This avoids inversion with
+boot settings load, which may already hold the backend lock while applying a
+record under the frame guard.
+
+The loader checks the serialized snap-mode range before changing any processor
+field. Snap-mode, threshold, timeout, saved-state and reset transitions clear
+their accumulation and decay time. Disabling a temporary layer schedules its
+removal even if a keep key is still held.
 
 ## Build / dependency wiring
 

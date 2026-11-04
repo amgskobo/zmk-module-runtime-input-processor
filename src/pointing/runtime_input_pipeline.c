@@ -15,6 +15,11 @@
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
+#if IS_ENABLED(CONFIG_ZMK_RUNTIME_INPUT_PIPELINE_TEST)
+void zmk_input_pipeline_test_after_event(const struct device *pipeline,
+                                         const struct device *processor, size_t index);
+#endif
+
 #define INPUTS CONFIG_ZMK_RUNTIME_INPUT_PIPELINE_FRAME_EVENTS
 #define OUTPUTS CONFIG_ZMK_RUNTIME_INPUT_PIPELINE_OUTPUT_EVENTS
 
@@ -180,8 +185,8 @@ static int16_t *remainder_for(struct pipeline_stage_data *state, const struct in
     }
 }
 
-static int process_frame(const struct device *dev, const struct pipeline_frame *frame,
-                         struct pipeline_buffer **result) {
+static int process_frame_locked(const struct device *dev, const struct pipeline_frame *frame,
+                                struct pipeline_buffer **result) {
     const struct pipeline_config *cfg = dev->config;
     struct pipeline_data *data = dev->data;
     struct pipeline_buffer *input = &data->buffers[0], *output = &data->buffers[1];
@@ -212,6 +217,11 @@ static int process_frame(const struct device *dev, const struct pipeline_frame *
             };
             int ret = zmk_input_processor_handle_event(
                 stage->entry.dev, &event, stage->entry.param1, stage->entry.param2, &context);
+#if IS_ENABLED(CONFIG_ZMK_RUNTIME_INPUT_PIPELINE_TEST)
+            if (stage->runtime) {
+                zmk_input_pipeline_test_after_event(dev, stage->entry.dev, e);
+            }
+#endif
             if (ret < 0) {
                 return ret;
             }
@@ -234,6 +244,14 @@ static int process_frame(const struct device *dev, const struct pipeline_frame *
 void zmk_input_pipeline_test_frame_admitted(const struct device *dev, int status);
 void zmk_input_pipeline_test_before_emit(const struct device *dev);
 #endif
+
+static int process_frame(const struct device *dev, const struct pipeline_frame *frame,
+                         struct pipeline_buffer **result) {
+    zmk_input_processor_runtime_frame_lock();
+    int ret = process_frame_locked(dev, frame, result);
+    zmk_input_processor_runtime_frame_unlock();
+    return ret;
+}
 
 static void pipeline_input(struct input_event *event, void *context) {
     const struct device *dev = context;

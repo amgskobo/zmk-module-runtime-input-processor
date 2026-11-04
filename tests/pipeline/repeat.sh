@@ -20,5 +20,7 @@ for repeat in 1 2 3; do
     sed -n -f "$owner/tests/pipeline/events.patterns" "$output/repeat-$repeat.log" > "$output/repeat-$repeat.events"
     diff -u "$owner/tests/pipeline/keycode_events.snapshot" "$output/repeat-$repeat.events"
     grep -q 'PASS: held_temporary_overrides' "$output/repeat-$repeat.log"
+    grep -q 'PASS: rip_complete_frame_settings' "$output/repeat-$repeat.log"
+    grep -q 'PASS: rip_inertia_input_thread' "$output/repeat-$repeat.log"
     echo "PASS: pipeline repeat $repeat"
 done

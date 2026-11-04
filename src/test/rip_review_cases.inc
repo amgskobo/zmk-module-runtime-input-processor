@@ -4,12 +4,16 @@
 #include <pb_encode.h>
 #include <pb_decode.h>
 #include <cormoran/rip/custom.pb.h>
+#include <zephyr/logging/log_ctrl.h>
 #include <zmk/studio/custom.h>
 
 #define REVIEW_REQUIRE(condition)                                                                  \
     do {                                                                                           \
         if (!(condition)) {                                                                        \
-            LOG_ERR("FAIL: rip_review line=%d", __LINE__);                                         \
+            /* A failed early init must not leave its diagnostic deferred. */                      \
+            LOG_PANIC();                                                                           \
+            LOG_ERR("FAIL: rip_review fixture=%s line=%d condition=%s", __func__, __LINE__,        \
+                    #condition);                                                                   \
             return -EINVAL;                                                                        \
         }                                                                                          \
     } while (0)

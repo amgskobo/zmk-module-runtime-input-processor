@@ -177,6 +177,7 @@ export function InputProcessorManager() {
   const [error, setError] = useState<string | null>(null);
   const [isUpdating, setIsUpdating] = useState(false);
   const formDirtyRef = useRef(false);
+  const inertiaToggleGeneration = useRef(0);
 
   // Layer information
   const [layers, setLayers] = useState<Array<{ index: number; name: string }>>(
@@ -288,6 +289,11 @@ export function InputProcessorManager() {
   // the stable index rather than its object identity in effects below.
   const subsystemIndex = subsystem?.index ?? null;
   const { locked } = useStudioLockState();
+  useEffect(() => {
+    return () => {
+      ++inertiaToggleGeneration.current;
+    };
+  }, [subsystemIndex, zmkApp?.state.connection]);
 
   // Studio's unlock requirement is per-request: when a mutating/reading call
   // fails with UNLOCK_REQUIRED, remember how to retry it and surface the
@@ -876,6 +882,7 @@ export function InputProcessorManager() {
     (id: number) => {
       const proc = processors.find((p) => p.id === id);
       if (proc) {
+        ++inertiaToggleGeneration.current;
         formDirtyRef.current = false;
         setSelectedProcessorId(id);
         setScaleMultiplier(proc.scaleMultiplier);
@@ -1015,6 +1022,7 @@ export function InputProcessorManager() {
 
             // If no processor is selected yet, select the first one
             if (selectedProcessorId === null) {
+              ++inertiaToggleGeneration.current;
               setSelectedProcessorId(proc.id);
               setScaleMultiplier(proc.scaleMultiplier);
               setScaleDivisor(proc.scaleDivisor);
@@ -1913,6 +1921,7 @@ export function InputProcessorManager() {
                   onChange={async (event) => {
                     if (selectedProcessorId === null) return;
                     const enabled = event.target.checked;
+                    const generation = ++inertiaToggleGeneration.current;
                     try {
                       const response = await callRPC(
                         Request.create({
@@ -1922,6 +1931,8 @@ export function InputProcessorManager() {
                           },
                         })
                       );
+                      if (generation !== inertiaToggleGeneration.current)
+                        return;
                       if (response?.error) {
                         setError(response.error.message);
                         return;
@@ -1932,6 +1943,8 @@ export function InputProcessorManager() {
                         setInertiaFastInput(false);
                       }
                     } catch (error) {
+                      if (generation !== inertiaToggleGeneration.current)
+                        return;
                       setError(
                         error instanceof Error ? error.message : String(error)
                       );

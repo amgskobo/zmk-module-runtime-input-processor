@@ -46,6 +46,7 @@ jobs:
           CMAKE_BUILD_PARALLEL_LEVEL: 4
         run: python3 -m unittest -v
       - name: Upload Build Artifacts
+        if: ${{ github.ref != 'refs/heads/codex/runtime-input-processor-review' }}
         uses: actions/upload-artifact@v4
         with:
           name: zmk-firmware

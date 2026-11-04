@@ -86,6 +86,8 @@
 	ZMK_MOCK_PRESS(1,0,10)
 	ZMK_MOCK_PRESS(0,0,10)
 	ZMK_MOCK_RELEASE(0,0,10)
-	ZMK_MOCK_RELEASE(1,0,10)
+	// The selected mock uses this final delay before its exit-only callback.
+	// Keep the 100-iteration layer timeout observable, including tick rounding.
+	ZMK_MOCK_RELEASE(1,0,250)
 	>;
 };

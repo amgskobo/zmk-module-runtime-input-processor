@@ -19,6 +19,11 @@ struct zmk_runtime_rotation_state {
 
 uint32_t zmk_input_processor_runtime_settings_generation(const struct device *processor);
 
+/* Hold across every stage of a complete pipeline frame. Configuration APIs
+ * use the same recursive guard; source callbacks never acquire it. */
+void zmk_input_processor_runtime_frame_lock(void);
+void zmk_input_processor_runtime_frame_unlock(void);
+
 /* Transform one complete relative frame. Output saturates at the signed
  * 16-bit pointing boundary; changes in effective rotation retire fractional state. */
 int zmk_input_processor_runtime_rotate_xy(const struct device *processor, int32_t x, int32_t y,

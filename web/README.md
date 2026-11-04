@@ -48,7 +48,8 @@ src/
 test/
 ├── App.spec.tsx                 # Connection and locked UI
 ├── InertiaToggle.spec.tsx       # Inertia settings and activity
-└── DraftNotification.spec.tsx   # Draft preservation across activity replies
+├── DraftNotification.spec.tsx   # Draft preservation across activity replies
+└── ActivitySelection.spec.tsx   # Retirement of replies after processor selection
 ```
 
 ## How It Works
@@ -122,6 +123,9 @@ npm run test:coverage
 The tests demonstrate how to use the `react-zmk-studio` test helpers:
 
 - **App.spec.tsx**: Basic rendering tests for the main application
+- **ActivitySelection.spec.tsx**: Deferred successful, error and rejected
+  activity-toggle replies after changing the selected processor, including
+  selection of the original processor again
 - **RPCTestSection.spec.tsx**: Tests showing how to mock ZMK connection and test
   components that interact with devices
 

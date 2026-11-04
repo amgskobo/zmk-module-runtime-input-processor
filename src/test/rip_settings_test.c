@@ -91,6 +91,7 @@ struct test_settings_record {
 };
 
 static struct test_settings_record test_settings_storage[TEST_SETTINGS_STORAGE_CAPACITY];
+static unsigned int test_settings_save_calls;
 
 static struct test_settings_record *test_settings_find_record(const char *name) {
     for (size_t i = 0; i < ARRAY_SIZE(test_settings_storage); i++) {
@@ -131,6 +132,7 @@ static int test_settings_load(struct settings_store *cs, const struct settings_l
 static int test_settings_save(struct settings_store *cs, const char *name, const char *value,
                               size_t val_len) {
     ARG_UNUSED(cs);
+    test_settings_save_calls++;
 
     struct test_settings_record *record = test_settings_find_record(name);
     if (value == NULL) {
@@ -920,6 +922,9 @@ static int test_write_modes_and_save_discard(void) {
 }
 
 #include "rip_review_cases.inc"
+#include "rip_boundary_cases.inc"
+#include "rip_write_mode_cases.inc"
+#include "rip_review_state_cases.inc"
 
 static int rip_settings_test_init(void) {
     int ret = test_settings_backend_init();
@@ -928,9 +933,36 @@ static int rip_settings_test_init(void) {
         return 0; // Never fail boot because of a test failure.
     }
 
+    /* Preserve the original unlocked protocol scenarios with locking enabled. */
+    zmk_studio_core_unlock();
+
     if (test_review_persist_snapshot() < 0 || test_review_rpc_widths() < 0) {
         return 0;
     }
+    if (test_boundary_rpc_authorization() < 0) {
+        LOG_ERR("FAIL: rip_locked_reads_and_mutations");
+    }
+    zmk_studio_core_unlock();
+    if (test_boundary_generic_authorization() < 0) {
+        LOG_ERR("FAIL: rip_generic_blob_authorization");
+    }
+    zmk_studio_core_unlock();
+    if (test_boundary_driver_values() < 0) {
+        LOG_ERR("FAIL: rip_full_width_driver_boundaries");
+    }
+    if (test_boundary_discard_snap() < 0) {
+        LOG_ERR("FAIL: rip_discard_retires_snap_state");
+    }
+    if (test_review_snap_setting_retirement() < 0) {
+        LOG_ERR("FAIL: rip_snap_setting_retirement");
+    }
+    if (test_review_invalid_snap_blob() < 0) {
+        LOG_ERR("FAIL: rip_invalid_snap_blob");
+    }
+    if (test_review_disabled_temp_layer() < 0) {
+        LOG_ERR("FAIL: rip_disabled_temp_layer");
+    }
+    zmk_input_processor_runtime_reset(zmk_input_processor_runtime_find_by_id(0));
     ret = test_scaling_persists_across_reload();
     if (ret < 0) {
         LOG_ERR("FAIL: rip_settings_persist_reload ret=%d", ret);
@@ -944,6 +976,9 @@ static int rip_settings_test_init(void) {
     ret = test_write_modes_and_save_discard();
     if (ret < 0) {
         LOG_ERR("FAIL: rip_settings_write_modes ret=%d", ret);
+    }
+    if (test_boundary_rpc_write_modes() < 0) {
+        LOG_ERR("FAIL: rip_rpc_write_mode_validation");
     }
     return 0;
 }

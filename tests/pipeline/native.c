@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <zephyr/kernel.h>
+#include <zephyr/init.h>
 #include <zephyr/input/input.h>
 #include <zephyr/sys/atomic.h>
 #include <zmk/hid.h>
@@ -22,17 +23,68 @@ static K_SEM_DEFINE(admission_ready, 0, 128);
 static K_SEM_DEFINE(pause_entered, 0, 1);
 static K_SEM_DEFINE(pause_release, 0, 1);
 static atomic_t pause_output;
+static K_SEM_DEFINE(settings_pause_entered, 0, 1);
+static K_SEM_DEFINE(settings_pause_release, 0, 1);
+static K_SEM_DEFINE(settings_setter_start, 0, 1);
+static K_SEM_DEFINE(settings_setter_entered, 0, 1);
+static K_SEM_DEFINE(settings_setter_done, 0, 1);
+static atomic_t pause_settings_frame;
+static int settings_setter_result;
+static k_tid_t report_thread;
+static K_SEM_DEFINE(input_pause_entered, 0, 1);
+static K_SEM_DEFINE(input_pause_release, 0, 1);
+static K_SEM_DEFINE(input_barrier, 0, 1);
+DEVICE_DEFINE(rip_test_pause_input, "rip-test-pause", NULL, NULL, NULL, NULL, POST_KERNEL,
+              CONFIG_KERNEL_INIT_PRIORITY_DEFAULT, NULL);
+
+static void input_pause_callback(struct input_event *event, void *context) {
+    ARG_UNUSED(context);
+    if (event->value == 1) {
+        k_sem_give(&input_pause_entered);
+        assert(k_sem_take(&input_pause_release, K_SECONDS(3)) == 0);
+    } else {
+        k_sem_give(&input_barrier);
+    }
+}
+INPUT_CALLBACK_DEFINE(DEVICE_GET(rip_test_pause_input), input_pause_callback, NULL);
 static struct zmk_hid_mouse_report_body reports[128];
 static unsigned int report_count, report_index;
 static int admissions[128];
 static unsigned int admission_count, admission_index;
 
 int __wrap_zmk_endpoint_send_mouse_report(void) {
+    if (report_thread == NULL) {
+        report_thread = k_current_get();
+    }
+    assert(report_thread == k_current_get());
     assert(report_count < ARRAY_SIZE(reports));
     reports[report_count++] = zmk_hid_get_mouse_report()->body;
     k_sem_give(&report_ready);
     return 0;
 }
+
+void zmk_input_pipeline_test_after_event(const struct device *pipeline,
+                                         const struct device *stage_processor, size_t index) {
+    if (pipeline == virtual_source && stage_processor == processor && index == 0 &&
+        atomic_cas(&pause_settings_frame, 1, 0)) {
+        k_sem_give(&settings_pause_entered);
+        assert(k_sem_take(&settings_pause_release, K_SECONDS(3)) == 0);
+    }
+}
+
+static void settings_setter(void *a, void *b, void *c) {
+    ARG_UNUSED(a);
+    ARG_UNUSED(b);
+    ARG_UNUSED(c);
+    for (;;) {
+        k_sem_take(&settings_setter_start, K_FOREVER);
+        k_sem_give(&settings_setter_entered);
+        settings_setter_result = zmk_input_processor_runtime_set_scaling(
+            processor, 1, 2, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY);
+        k_sem_give(&settings_setter_done);
+    }
+}
+K_THREAD_DEFINE(pipeline_settings_setter, 3072, settings_setter, NULL, NULL, NULL, 6, 0, 0);
 
 void zmk_input_pipeline_test_before_emit(const struct device *dev) {
     if (dev == virtual_source && atomic_cas(&pause_output, 1, 0)) {
@@ -166,6 +218,90 @@ static void test_held_overrides(void) {
     printk("PASS: held_temporary_overrides\n");
 }
 
+static void test_complete_frame_settings(void) {
+    angle(processor, 0);
+    angle(second_processor, 0);
+    assert(zmk_input_processor_runtime_set_scaling(
+               processor, 1, 1, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY) == 0);
+    atomic_set(&pause_settings_frame, 1);
+    xy(10, 10);
+    assert(k_sem_take(&settings_pause_entered, K_SECONDS(2)) == 0);
+    k_sem_give(&settings_setter_start);
+    assert(k_sem_take(&settings_setter_entered, K_SECONDS(2)) == 0);
+    assert(k_sem_take(&settings_setter_done, K_MSEC(20)) == -EAGAIN);
+    k_sem_give(&settings_pause_release);
+    assert(k_sem_take(&settings_setter_done, K_SECONDS(2)) == 0);
+    assert(settings_setter_result == 0);
+    expect_xy(-10, 10);
+    xy(10, 10);
+    expect_xy(-5, 5);
+    assert(zmk_input_processor_runtime_set_scaling(
+               processor, 1, 1, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY) == 0);
+    printk("PASS: rip_complete_frame_settings\n");
+}
+
+static void test_inertia_input_thread(void) {
+    const uint16_t codes[] = {INPUT_REL_X, INPUT_REL_Y, INPUT_REL_HWHEEL, INPUT_REL_WHEEL};
+    for (size_t i = 0; i < ARRAY_SIZE(codes); i++) {
+        assert(zmk_input_processor_runtime_test_queue_inertia(processor, codes[i], 7) == 0);
+        struct zmk_hid_mouse_report_body report = next_report();
+        assert(report.d_x == (codes[i] == INPUT_REL_X ? 7 : 0));
+        assert(report.d_y == (codes[i] == INPUT_REL_Y ? 7 : 0));
+        assert(report.d_scroll_x == (codes[i] == INPUT_REL_HWHEEL ? 7 : 0));
+        assert(report.d_scroll_y == (codes[i] == INPUT_REL_WHEEL ? 7 : 0));
+        assert(report.buttons == 0);
+    }
+    /* The producer runs on this test thread; the recording sink requires the
+     * same thread as physical reports. No downstream scaler may touch inertia. */
+    xy(3, 4);
+    expect_xy(-3, 4);
+    assert(zmk_input_processor_runtime_test_queue_inertia(second_processor, INPUT_REL_Y, -9) == 0);
+    struct zmk_hid_mouse_report_body second = next_report();
+    assert(second.d_x == 0 && second.d_y == -9 && second.d_scroll_x == 0 && second.d_scroll_y == 0);
+    assert(k_sem_take(&report_ready, K_NO_WAIT) != 0);
+
+    /* Retire a queued sample before the real input thread can consume it. */
+    const struct device *pause_source = DEVICE_GET(rip_test_pause_input);
+    assert(input_report(pause_source, INPUT_EV_MSC, INPUT_MSC_SCAN, 1, true, K_FOREVER) == 0);
+    assert(k_sem_take(&input_pause_entered, K_SECONDS(2)) == 0);
+    assert(zmk_input_processor_runtime_test_queue_inertia(processor, INPUT_REL_X, 11) == 0);
+    assert(zmk_input_processor_runtime_set_scaling(
+               processor, 2, 1, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY) == 0);
+    k_sem_give(&input_pause_release);
+    assert(input_report(pause_source, INPUT_EV_MSC, INPUT_MSC_SCAN, 2, true, K_FOREVER) == 0);
+    assert(k_sem_take(&input_barrier, K_SECONDS(2)) == 0);
+    assert(k_sem_take(&report_ready, K_NO_WAIT) != 0);
+    assert(zmk_input_processor_runtime_set_scaling(
+               processor, 1, 1, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY) == 0);
+
+    /* A full queue drops bounded output without blocking the producer or
+     * converting an accepted header into an extra movement later. */
+    assert(input_report(pause_source, INPUT_EV_MSC, INPUT_MSC_SCAN, 1, true, K_FOREVER) == 0);
+    assert(k_sem_take(&input_pause_entered, K_SECONDS(2)) == 0);
+    unsigned accepted = 0;
+    int ret = 0;
+    for (unsigned i = 0; i <= CONFIG_INPUT_QUEUE_MAX_MSGS; i++) {
+        ret = zmk_input_processor_runtime_test_queue_inertia(processor, INPUT_REL_X, 7);
+        if (ret < 0) {
+            break;
+        }
+        ++accepted;
+    }
+    assert(ret < 0 && accepted > 0);
+    k_sem_give(&input_pause_release);
+    assert(input_report(pause_source, INPUT_EV_MSC, INPUT_MSC_SCAN, 2, true, K_FOREVER) == 0);
+    assert(k_sem_take(&input_barrier, K_SECONDS(2)) == 0);
+    for (unsigned i = 0; i < accepted; i++) {
+        struct zmk_hid_mouse_report_body report = next_report();
+        assert(report.d_x == 7 && report.d_y == 0 && report.d_scroll_x == 0 &&
+               report.d_scroll_y == 0);
+    }
+    assert(k_sem_take(&report_ready, K_NO_WAIT) != 0);
+    xy(1, 2);
+    expect_xy(-1, 2);
+    printk("PASS: rip_inertia_input_thread\n");
+}
+
 static void pipeline_test_run(void *unused1, void *unused2, void *unused3) {
     ARG_UNUSED(unused1);
     ARG_UNUSED(unused2);
@@ -251,6 +387,8 @@ static void pipeline_test_run(void *unused1, void *unused2, void *unused3) {
     expect_xy(5, 4);
     assert(k_sem_take(&report_ready, K_NO_WAIT) != 0);
     printk("PASS: runtime_pipeline_queue_recovery\n");
+    test_complete_frame_settings();
+    test_inertia_input_thread();
     exit(0);
 }
 K_THREAD_DEFINE(pipeline_test_runner, 4096, pipeline_test_run, NULL, NULL, NULL, 5, 0, 0);

@@ -35,8 +35,17 @@
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
+K_MUTEX_DEFINE(runtime_settings_guard);
+
+void zmk_input_processor_runtime_frame_lock(void) {
+    k_mutex_lock(&runtime_settings_guard, K_FOREVER);
+}
+
+void zmk_input_processor_runtime_frame_unlock(void) { k_mutex_unlock(&runtime_settings_guard); }
+
 struct runtime_processor_config {
     const char *name;
+    const struct device *inertia_input;
     uint8_t type;
     size_t x_codes_len;
     size_t y_codes_len;
@@ -107,6 +116,7 @@ struct runtime_processor_data {
 #if IS_ENABLED(CONFIG_ZMK_CUSTOM_SETTINGS)
     struct k_work_delayable save_work;
     struct k_mutex save_lock;
+    struct k_mutex save_io_lock;
     uint8_t pending_save[CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE];
     size_t pending_save_size;
     bool pending_save_valid;
@@ -124,6 +134,9 @@ struct runtime_processor_data {
     /* Bias-packed sine/cosine are published as one atomic snapshot. */
     atomic_t rotation_trig;
     atomic_t settings_generation;
+    atomic_t inertia_input_epoch;
+    uint32_t inertia_received_epoch;
+    bool inertia_received_epoch_valid;
     uint32_t remainder_generations[RUNTIME_REMAINDER_SOURCES][4];
     bool rotation_source_warned;
 
@@ -236,7 +249,7 @@ static void update_rotation_values(struct runtime_processor_data *data) {
 }
 
 // Temp-layer layer work handlers
-static void temp_layer_activation_work_handler(struct k_work *work) {
+static void temp_layer_activation_work_handler_locked(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     struct runtime_processor_data *data =
         CONTAINER_OF(dwork, struct runtime_processor_data, temp_layer_activation_work);
@@ -276,12 +289,19 @@ static void temp_layer_activation_work_handler(struct k_work *work) {
     }
 }
 
-static void temp_layer_deactivation_work_handler(struct k_work *work) {
+static void temp_layer_activation_work_handler(struct k_work *work) {
+    k_mutex_lock(&runtime_settings_guard, K_FOREVER);
+    temp_layer_activation_work_handler_locked(work);
+    k_mutex_unlock(&runtime_settings_guard);
+}
+
+static void temp_layer_deactivation_work_handler_locked(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     struct runtime_processor_data *data =
         CONTAINER_OF(dwork, struct runtime_processor_data, temp_layer_deactivation_work);
 
-    if (!data->temp_layer_layer_active || data->temp_layer_keep_active) {
+    if (!data->temp_layer_layer_active ||
+        (data->temp_layer_enabled && data->temp_layer_keep_active)) {
         return;
     }
 
@@ -293,6 +313,12 @@ static void temp_layer_deactivation_work_handler(struct k_work *work) {
     } else {
         LOG_ERR("Failed to deactivate temp-layer layer %d: %d", data->temp_layer_layer, ret);
     }
+}
+
+static void temp_layer_deactivation_work_handler(struct k_work *work) {
+    k_mutex_lock(&runtime_settings_guard, K_FOREVER);
+    temp_layer_deactivation_work_handler_locked(work);
+    k_mutex_unlock(&runtime_settings_guard);
 }
 
 static int code_idx(uint16_t code, const uint16_t *list, size_t len) {
@@ -332,7 +358,7 @@ static bool is_processor_active_for_current_layers(uint32_t active_layers_mask) 
     return false;
 }
 
-static int scale_val(struct input_event *event, uint32_t mul, uint32_t div,
+static int scale_val(struct input_event *event, int64_t value, uint32_t mul, uint32_t div,
                      struct zmk_input_processor_state *state) {
     if (div > ZMK_INPUT_PROCESSOR_RUNTIME_MAX_SCALE_DIVISOR) {
         return -EINVAL;
@@ -341,7 +367,7 @@ static int scale_val(struct input_event *event, uint32_t mul, uint32_t div,
         return ZMK_INPUT_PROC_CONTINUE;
     }
 
-    int64_t value_mul = (int64_t)event->value * mul;
+    int64_t value_mul = value * mul;
 
     if (state && state->remainder) {
         value_mul += *state->remainder;
@@ -354,7 +380,7 @@ static int scale_val(struct input_event *event, uint32_t mul, uint32_t div,
     }
 
     scaled = scaled > INT16_MAX ? INT16_MAX : scaled < INT16_MIN ? INT16_MIN : scaled;
-    LOG_DBG("scaled %d with %u/%u to %d", event->value, mul, div, (int)scaled);
+    LOG_DBG("scaled %lld with %u/%u to %d", (long long)value, mul, div, (int)scaled);
 
     event->value = (int16_t)scaled;
     return 0;
@@ -385,6 +411,7 @@ static void inertia_clear_windows(struct runtime_processor_data *data) {
 
 static void inertia_stop(struct runtime_processor_data *data,
                          enum zmk_input_processor_inertia_stop_reason reason) {
+    atomic_inc(&data->inertia_input_epoch);
     bool was_active = data->inertia_active;
     data->inertia_active = false;
     inertia_clear_windows(data);
@@ -675,28 +702,42 @@ int zmk_input_processor_runtime_test_inertia_latest_bucket(void) {
 }
 #endif
 
-/* Inertia is already in its final, processor-transformed coordinate
- * system. Do not inject it back into the source input device: that would send
- * it through every input processor again, allowing a later processor to turn
- * a scroll event back into pointer movement (or vice versa). */
-static void inertia_emit(uint16_t code, int16_t value) {
-    /* A processor may be present in builds that omit the pointing endpoint. */
-#if IS_ENABLED(CONFIG_ZMK_POINTING)
-    switch (code) {
+/* Final-coordinate inertia has a private input device per processor. Its
+ * events bypass source transforms but are delivered on the same input thread
+ * as ordinary listener HID updates. No workqueue callback touches HID. */
+#if IS_ENABLED(CONFIG_ZMK_POINTING) && IS_ENABLED(CONFIG_INPUT_MODE_THREAD)
+static const uint8_t runtime_inertia_input_api;
+
+static void inertia_input_callback(struct input_event *event, void *context) {
+    ARG_UNUSED(context);
+    if (!event->dev || event->dev->api != &runtime_inertia_input_api) {
+        return;
+    }
+    struct runtime_processor_data *data = event->dev->data;
+    if (event->type == INPUT_EV_MSC && event->code == INPUT_MSC_SCAN) {
+        data->inertia_received_epoch = (uint32_t)event->value;
+        data->inertia_received_epoch_valid = true;
+        return;
+    }
+    if (event->type != INPUT_EV_REL || !data->inertia_received_epoch_valid ||
+        data->inertia_received_epoch != (uint32_t)atomic_get(&data->inertia_input_epoch)) {
+        return;
+    }
+    switch (event->code) {
     case INPUT_REL_X:
-        zmk_hid_mouse_movement_set(value, 0);
+        zmk_hid_mouse_movement_set(event->value, 0);
         break;
     case INPUT_REL_Y:
-        zmk_hid_mouse_movement_set(0, value);
+        zmk_hid_mouse_movement_set(0, event->value);
         break;
     case INPUT_REL_HWHEEL:
-        zmk_hid_mouse_scroll_set(value, 0);
+        zmk_hid_mouse_scroll_set(event->value, 0);
         break;
     case INPUT_REL_WHEEL:
-        zmk_hid_mouse_scroll_set(0, value);
+        zmk_hid_mouse_scroll_set(0, event->value);
         break;
     default:
-        LOG_WRN("Inertia ignored unsupported output code %u", code);
+        LOG_WRN("Inertia ignored unsupported output code %u", event->code);
         return;
     }
 
@@ -706,13 +747,54 @@ static void inertia_emit(uint16_t code, int16_t value) {
     }
     zmk_hid_mouse_scroll_set(0, 0);
     zmk_hid_mouse_movement_set(0, 0);
+}
+INPUT_CALLBACK_DEFINE(NULL, inertia_input_callback, NULL);
+
+#define RIP_INERTIA_INPUT_DECLARE(n) DEVICE_DECLARE(runtime_inertia_input_##n)
+#define RIP_INERTIA_INPUT_GET(n) DEVICE_GET(runtime_inertia_input_##n)
+#define RIP_INERTIA_INPUT_DEFINE(n)                                                                \
+    DEVICE_DEFINE(runtime_inertia_input_##n, "rip-inertia-" STRINGIFY(n), NULL, NULL,              \
+                  &runtime_data_##n, NULL, POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT,       \
+                  &runtime_inertia_input_api)
 #else
+#define RIP_INERTIA_INPUT_DECLARE(n)
+#define RIP_INERTIA_INPUT_GET(n) NULL
+#define RIP_INERTIA_INPUT_DEFINE(n)
+#endif
+
+static int inertia_emit(struct runtime_processor_data *data, uint16_t code, int16_t value) {
+#if IS_ENABLED(CONFIG_ZMK_POINTING) && IS_ENABLED(CONFIG_INPUT_MODE_THREAD)
+    const struct runtime_processor_config *cfg = data->dev->config;
+    /* A header without its value is harmless. A failed header never sends a
+     * value, and the per-device FIFO preserves header/value ordering. */
+    int ret = input_report(cfg->inertia_input, INPUT_EV_MSC, INPUT_MSC_SCAN,
+                           (int32_t)atomic_get(&data->inertia_input_epoch), false, K_NO_WAIT);
+    if (ret == 0) {
+        ret = input_report_rel(cfg->inertia_input, code, value, true, K_NO_WAIT);
+    }
+    return ret;
+#else
+    ARG_UNUSED(data);
     ARG_UNUSED(code);
     ARG_UNUSED(value);
+    return -ENOTSUP;
 #endif
 }
 
-static void inertia_work_handler(struct k_work *work) {
+#if IS_ENABLED(CONFIG_ZMK_RUNTIME_INPUT_PIPELINE_TEST)
+int zmk_input_processor_runtime_test_queue_inertia(const struct device *dev, uint16_t code,
+                                                   int16_t value) {
+    if (!dev) {
+        return -EINVAL;
+    }
+    k_mutex_lock(&runtime_settings_guard, K_FOREVER);
+    int ret = inertia_emit(dev->data, code, value);
+    k_mutex_unlock(&runtime_settings_guard);
+    return ret;
+}
+#endif
+
+static void inertia_work_handler_locked(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     struct runtime_processor_data *data =
         CONTAINER_OF(dwork, struct runtime_processor_data, inertia_work);
@@ -724,8 +806,10 @@ static void inertia_work_handler(struct k_work *work) {
 
     int16_t output = inertia_finish_interval(data, k_uptime_get());
     if (output != 0) {
-        inertia_emit(data->inertia_output_code, output);
-        LOG_DBG("Inertia emitted %d every %u ms", output, data->inertia_interval_ms);
+        int ret = inertia_emit(data, data->inertia_output_code, output);
+        if (ret < 0) {
+            LOG_WRN("Inertia dropped output because the input queue is unavailable (%d)", ret);
+        }
     }
 
     if (data->inertia_active) {
@@ -733,10 +817,17 @@ static void inertia_work_handler(struct k_work *work) {
     }
 }
 
+static void inertia_work_handler(struct k_work *work) {
+    k_mutex_lock(&runtime_settings_guard, K_FOREVER);
+    inertia_work_handler_locked(work);
+    k_mutex_unlock(&runtime_settings_guard);
+}
+
 static void inertia_start(struct runtime_processor_data *data, uint8_t axis, int8_t direction,
                           uint16_t output_code, int64_t now) {
     uint64_t initial_amount_q16 =
         inertia_window_total_q16(&data->inertia_trigger[axis], now, data->inertia_window_ms);
+    atomic_inc(&data->inertia_input_epoch);
     data->inertia_measurement = data->inertia_trigger[axis];
     data->inertia_scaled_measurement = data->inertia_scaled_trigger[axis];
     data->inertia_fast_active =
@@ -773,8 +864,9 @@ static void inertia_start(struct runtime_processor_data *data, uint8_t axis, int
 
 static void inertia_handle_physical_event(struct runtime_processor_data *data, uint8_t axis,
                                           const struct input_event *event, int16_t raw_value) {
-    if (!IS_ENABLED(CONFIG_ZMK_POINTING) || event->type != INPUT_EV_REL || raw_value == 0 ||
-        !data->inertia_enabled || data->inertia_window_ms == 0 || data->inertia_interval_ms == 0) {
+    if (!IS_ENABLED(CONFIG_ZMK_POINTING) || !IS_ENABLED(CONFIG_INPUT_MODE_THREAD) ||
+        event->type != INPUT_EV_REL || raw_value == 0 || !data->inertia_enabled ||
+        data->inertia_window_ms == 0 || data->inertia_interval_ms == 0) {
         return;
     }
 
@@ -876,9 +968,10 @@ bool zmk_input_processor_runtime_rotation_codes(const struct device *processor, 
     return true;
 }
 
-int zmk_input_processor_runtime_rotate_xy(const struct device *processor, int32_t x, int32_t y,
-                                          struct zmk_runtime_rotation_state *state,
-                                          int16_t *rotated_x, int16_t *rotated_y) {
+static int zmk_input_processor_runtime_rotate_xy_locked(const struct device *processor, int32_t x,
+                                                        int32_t y,
+                                                        struct zmk_runtime_rotation_state *state,
+                                                        int16_t *rotated_x, int16_t *rotated_y) {
     if (!processor || !state || !rotated_x || !rotated_y) {
         return -EINVAL;
     }
@@ -941,9 +1034,10 @@ static void retire_inline_remainder(const struct device *dev, const struct input
     }
 }
 
-static int runtime_processor_handle_event(const struct device *dev, struct input_event *event,
-                                          uint32_t param1, uint32_t param2,
-                                          struct zmk_input_processor_state *state) {
+static int runtime_processor_handle_event_locked(const struct device *dev,
+                                                 struct input_event *event, uint32_t param1,
+                                                 uint32_t param2,
+                                                 struct zmk_input_processor_state *state) {
     const struct runtime_processor_config *cfg = dev->config;
     struct runtime_processor_data *data = dev->data;
 
@@ -977,7 +1071,9 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
     }
 
     bool is_x = (x_idx >= 0);
-    int16_t value = event->value;
+    /* The input ABI is int32_t. Inverting its minimum needs one extra bit;
+     * retain that precision through snapping and scaling, then saturate once. */
+    int64_t value = event->value;
 
     // Apply code mapping (XY swap and XY-to-scroll)
     // These mappings are mutually exclusive - XY-to-scroll takes precedence
@@ -1023,12 +1119,11 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
 
     // Apply axis inversion after rotation
     if ((is_x && data->x_invert) || (!is_x && data->y_invert)) {
-        event->value = -event->value;
+        value = -value;
     }
-    value = event->value;
 
     // Apply axis snapping if configured
-    if (data->axis_snap_mode != ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_NONE && event->value != 0) {
+    if (data->axis_snap_mode != ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_NONE && value != 0) {
         int64_t now = k_uptime_get();
         bool is_snapped_axis =
             (data->axis_snap_mode == ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_X && is_x) ||
@@ -1085,53 +1180,45 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
                                             : data->axis_snap_cross_axis_accum;
             bool is_unsnapped = current_abs_accum >= data->axis_snap_threshold;
 
+            int64_t accumulated;
             if (is_unsnapped) {
                 // Just increase accumulator when already unsnapped
-                data->axis_snap_cross_axis_accum = current_abs_accum + (value > 0 ? value : -value);
+                accumulated = (int64_t)current_abs_accum + (value > 0 ? value : -value);
             } else {
                 // Accumulate normally when snapped (no abs)
-                data->axis_snap_cross_axis_accum += value;
+                accumulated = (int64_t)data->axis_snap_cross_axis_accum + value;
             }
             // Reset decay timer on movement
             data->axis_snap_last_decay_timestamp = now;
 
             // Check if threshold exceeded (check absolute value)
-            int32_t abs_accum = data->axis_snap_cross_axis_accum < 0
-                                    ? -data->axis_snap_cross_axis_accum
-                                    : data->axis_snap_cross_axis_accum;
+            int64_t abs_accum = accumulated < 0 ? -accumulated : accumulated;
+            int32_t cap = (int32_t)data->axis_snap_threshold * 2;
+            data->axis_snap_cross_axis_accum = accumulated > cap    ? cap
+                                               : accumulated < -cap ? -cap
+                                                                    : (int32_t)accumulated;
 
             if (abs_accum >= data->axis_snap_threshold) {
                 LOG_DBG("Axis snap: unlocked (threshold=%d exceeded with accum=%d)",
                         data->axis_snap_threshold, data->axis_snap_cross_axis_accum);
-                // cap the accumulator to twice the threshold so that it decays
-                // under threshold within timeout
-                if (abs_accum > data->axis_snap_threshold * 2) {
-                    data->axis_snap_cross_axis_accum =
-                        (data->axis_snap_cross_axis_accum > 0 ? data->axis_snap_threshold
-                                                              : -data->axis_snap_threshold) *
-                        2;
-                }
             } else {
                 // Suppress cross-axis movement while locked
-                event->value = 0;
+                value = 0;
                 LOG_DBG("Axis snap: suppressing cross-axis movement (accum=%d, "
                         "threshold=%d)",
                         data->axis_snap_cross_axis_accum, data->axis_snap_threshold);
             }
         }
-
-        // Update value after snap processing
-        value = event->value;
     }
 
     // Inertia measures speed before scaling. Keep the scaled report too, so
     // its entry threshold remains in the units seen by the user.
+    event->value = value > INT16_MAX ? INT16_MAX : value < INT16_MIN ? INT16_MIN : (int16_t)value;
     int16_t inertia_raw_value = event->value;
 
     // Apply scaling
     if (data->scale_multiplier > 0 && data->scale_divisor > 0) {
-        scale_val(event, data->scale_multiplier, data->scale_divisor, state);
-        value = event->value;
+        scale_val(event, value, data->scale_multiplier, data->scale_divisor, state);
     }
 
     inertia_handle_physical_event(data, is_x ? 0 : 1, event, inertia_raw_value);
@@ -1144,6 +1231,15 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
     }
 
     return ZMK_INPUT_PROC_CONTINUE;
+}
+
+static int runtime_processor_handle_event(const struct device *dev, struct input_event *event,
+                                          uint32_t param1, uint32_t param2,
+                                          struct zmk_input_processor_state *state) {
+    k_mutex_lock(&runtime_settings_guard, K_FOREVER);
+    int ret = runtime_processor_handle_event_locked(dev, event, param1, param2, state);
+    k_mutex_unlock(&runtime_settings_guard);
+    return ret;
 }
 
 static struct zmk_input_processor_driver_api runtime_processor_driver_api = {
@@ -1280,8 +1376,8 @@ static size_t pack_processor_settings(const struct runtime_processor_data *data,
 }
 
 /* v1 has no inertia fields; start from the current devicetree defaults. */
-static int unpack_and_apply_processor_settings(struct runtime_processor_data *data,
-                                               const uint8_t *buf, size_t len) {
+static int unpack_and_apply_processor_settings_locked(struct runtime_processor_data *data,
+                                                      const uint8_t *buf, size_t len) {
     struct rip_persist_v2 settings = {0};
     uint16_t normal_max_output = data->persistent_inertia_normal_max_output;
     if (len == 1 + sizeof(struct rip_persist_v1) && buf[0] == 1) {
@@ -1314,7 +1410,8 @@ static int unpack_and_apply_processor_settings(struct runtime_processor_data *da
     }
 
     const struct rip_persist_v1 *v1 = &settings.v1;
-    if (v1->scale_divisor > ZMK_INPUT_PROCESSOR_RUNTIME_MAX_SCALE_DIVISOR) {
+    if (v1->scale_divisor > ZMK_INPUT_PROCESSOR_RUNTIME_MAX_SCALE_DIVISOR ||
+        v1->axis_snap_mode > ZMK_INPUT_PROCESSOR_AXIS_SNAP_MODE_Y) {
         return -EINVAL;
     }
     data->persistent_scale_multiplier = data->scale_multiplier = v1->scale_multiplier;
@@ -1330,6 +1427,8 @@ static int unpack_and_apply_processor_settings(struct runtime_processor_data *da
     data->persistent_axis_snap_mode = data->axis_snap_mode = v1->axis_snap_mode;
     data->persistent_axis_snap_threshold = data->axis_snap_threshold = v1->axis_snap_threshold;
     data->persistent_axis_snap_timeout_ms = data->axis_snap_timeout_ms = v1->axis_snap_timeout_ms;
+    data->axis_snap_cross_axis_accum = 0;
+    data->axis_snap_last_decay_timestamp = 0;
     data->persistent_xy_to_scroll_enabled = data->xy_to_scroll_enabled = v1->xy_to_scroll_enabled;
     data->persistent_xy_swap_enabled = data->xy_swap_enabled = v1->xy_swap_enabled;
     data->persistent_x_invert = data->x_invert = v1->x_invert;
@@ -1349,11 +1448,26 @@ static int unpack_and_apply_processor_settings(struct runtime_processor_data *da
     inertia_stop(data, ZMK_INPUT_PROCESSOR_INERTIA_STOP_REASON_SETTINGS_CHANGED);
     data->temp_layer_activation_pending = false;
     k_work_cancel_delayable(&data->temp_layer_activation_work);
+    if (!data->temp_layer_enabled && data->temp_layer_layer_active) {
+        k_work_reschedule(&data->temp_layer_deactivation_work, K_NO_WAIT);
+    }
     update_rotation_values(data);
     return 0;
 }
 
+static int unpack_and_apply_processor_settings(struct runtime_processor_data *data,
+                                               const uint8_t *buf, size_t len) {
+    k_mutex_lock(&runtime_settings_guard, K_FOREVER);
+    int ret = unpack_and_apply_processor_settings_locked(data, buf, len);
+    k_mutex_unlock(&runtime_settings_guard);
+    return ret;
+}
+
 #if IS_ENABLED(CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_TEST)
+size_t zmk_input_processor_runtime_test_snap_mode_offset(void) {
+    return 1 + offsetof(struct rip_persist_v3, v2.v1.axis_snap_mode);
+}
+
 int zmk_input_processor_runtime_test_apply_legacy_v1(const struct device *dev) {
     if (!dev) {
         return -EINVAL;
@@ -1404,12 +1518,17 @@ static int persist_processor_snapshot(const struct device *dev, const uint8_t *b
 
 static int save_processor_settings_now(const struct device *dev) {
     struct runtime_processor_data *data = dev->data;
+    uint8_t snapshot[CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE];
+    k_mutex_lock(&data->save_io_lock, K_FOREVER);
+    k_mutex_lock(&runtime_settings_guard, K_FOREVER);
     k_mutex_lock(&data->save_lock, K_FOREVER);
     k_work_cancel_delayable(&data->save_work);
     data->pending_save_valid = false;
-    data->pending_save_size = pack_processor_settings(data, data->pending_save);
-    int ret = persist_processor_snapshot(dev, data->pending_save, data->pending_save_size);
+    size_t size = pack_processor_settings(data, snapshot);
     k_mutex_unlock(&data->save_lock);
+    k_mutex_unlock(&runtime_settings_guard);
+    int ret = persist_processor_snapshot(dev, snapshot, size);
+    k_mutex_unlock(&data->save_io_lock);
     return ret;
 }
 
@@ -1417,12 +1536,20 @@ static void save_processor_settings_work_handler(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     struct runtime_processor_data *data =
         CONTAINER_OF(dwork, struct runtime_processor_data, save_work);
+    uint8_t snapshot[CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE];
+    size_t size = 0;
+    k_mutex_lock(&data->save_io_lock, K_FOREVER);
     k_mutex_lock(&data->save_lock, K_FOREVER);
     if (data->pending_save_valid) {
         data->pending_save_valid = false;
-        persist_processor_snapshot(data->dev, data->pending_save, data->pending_save_size);
+        size = data->pending_save_size;
+        memcpy(snapshot, data->pending_save, size);
     }
     k_mutex_unlock(&data->save_lock);
+    if (size) {
+        persist_processor_snapshot(data->dev, snapshot, size);
+    }
+    k_mutex_unlock(&data->save_io_lock);
 }
 
 static int schedule_save_processor_settings(const struct device *dev) {
@@ -1531,6 +1658,7 @@ static int runtime_processor_init(const struct device *dev) {
     data->dev = dev;
 #if IS_ENABLED(CONFIG_ZMK_CUSTOM_SETTINGS)
     k_mutex_init(&data->save_lock);
+    k_mutex_init(&data->save_io_lock);
     k_work_init_delayable(&data->save_work, save_processor_settings_work_handler);
 #endif
     // Initialize temp-layer work queues
@@ -1653,6 +1781,7 @@ static void load_processor_defaults(const struct device *dev) {
     data->persistent_axis_snap_threshold = cfg->initial_axis_snap_threshold;
     data->persistent_axis_snap_timeout_ms = cfg->initial_axis_snap_timeout_ms;
     data->axis_snap_cross_axis_accum = 0;
+    data->axis_snap_last_decay_timestamp = 0;
 
     // Reset code mapping settings to defaults
     data->xy_to_scroll_enabled = cfg->initial_xy_to_scroll_enabled;
@@ -1689,9 +1818,10 @@ static void load_processor_defaults(const struct device *dev) {
 }
 
 // Public API for runtime configuration
-int zmk_input_processor_runtime_set_scaling(const struct device *dev, uint32_t multiplier,
-                                            uint32_t divisor,
-                                            enum zmk_input_processor_runtime_write_mode mode) {
+static int
+zmk_input_processor_runtime_set_scaling_locked(const struct device *dev, uint32_t multiplier,
+                                               uint32_t divisor,
+                                               enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev || divisor > ZMK_INPUT_PROCESSOR_RUNTIME_MAX_SCALE_DIVISOR) {
         return -EINVAL;
     }
@@ -1722,8 +1852,9 @@ int zmk_input_processor_runtime_set_scaling(const struct device *dev, uint32_t m
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_rotation(const struct device *dev, int32_t degrees,
-                                             enum zmk_input_processor_runtime_write_mode mode) {
+static int
+zmk_input_processor_runtime_set_rotation_locked(const struct device *dev, int32_t degrees,
+                                                enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev) {
         return -EINVAL;
     }
@@ -1747,7 +1878,7 @@ int zmk_input_processor_runtime_set_rotation(const struct device *dev, int32_t d
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_reset(const struct device *dev) {
+static int zmk_input_processor_runtime_reset_locked(const struct device *dev) {
     if (!dev) {
         return -EINVAL;
     }
@@ -1761,7 +1892,7 @@ int zmk_input_processor_runtime_reset(const struct device *dev) {
     return commit_write(dev, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_PERSIST);
 }
 
-void zmk_input_processor_runtime_restore_persistent(const struct device *dev) {
+static void zmk_input_processor_runtime_restore_persistent_locked(const struct device *dev) {
     if (!dev) {
         return;
     }
@@ -1804,8 +1935,9 @@ void zmk_input_processor_runtime_restore_persistent(const struct device *dev) {
     LOG_DBG("Restored persistent values");
 }
 
-int zmk_input_processor_runtime_get_config(const struct device *dev, const char **name,
-                                           struct zmk_input_processor_runtime_config *config) {
+static int
+zmk_input_processor_runtime_get_config_locked(const struct device *dev, const char **name,
+                                              struct zmk_input_processor_runtime_config *config) {
     if (!dev) {
         return -EINVAL;
     }
@@ -1849,6 +1981,10 @@ int zmk_input_processor_runtime_get_config(const struct device *dev, const char 
 }
 
 #define RUNTIME_PROCESSOR_INST(n)                                                                  \
+    RIP_INERTIA_INPUT_DECLARE(n);                                                                  \
+    BUILD_ASSERT(!DT_INST_PROP(n, inertia_enabled) || !IS_ENABLED(CONFIG_ZMK_POINTING) ||          \
+                     IS_ENABLED(CONFIG_INPUT_MODE_THREAD),                                         \
+                 "Runtime inertia requires threaded input");                                       \
     BUILD_ASSERT(DT_INST_PROP_OR(n, scale_divisor, 1) >= 0 &&                                      \
                      DT_INST_PROP_OR(n, scale_divisor, 1) <=                                       \
                          ZMK_INPUT_PROCESSOR_RUNTIME_MAX_SCALE_DIVISOR,                            \
@@ -1871,6 +2007,7 @@ int zmk_input_processor_runtime_get_config(const struct device *dev, const char 
                                              CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_NAME_MAX_LEN));    \
     static const struct runtime_processor_config runtime_config_##n = {                            \
         .name = DT_INST_PROP(n, processor_label),                                                  \
+        .inertia_input = RIP_INERTIA_INPUT_GET(n),                                                 \
         .type = DT_INST_PROP_OR(n, type, INPUT_EV_REL),                                            \
         .x_codes_len = DT_INST_PROP_LEN(n, x_codes),                                               \
         .y_codes_len = DT_INST_PROP_LEN(n, y_codes),                                               \
@@ -1916,6 +2053,7 @@ int zmk_input_processor_runtime_get_config(const struct device *dev, const char 
             DT_INST_PROP_OR(n, inertia_fast_output_percent, 200),                                  \
     };                                                                                             \
     static struct runtime_processor_data runtime_data_##n;                                         \
+    RIP_INERTIA_INPUT_DEFINE(n);                                                                   \
     DEVICE_DT_INST_DEFINE(n, &runtime_processor_init, NULL, &runtime_data_##n,                     \
                           &runtime_config_##n, POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT,   \
                           &runtime_processor_driver_api);
@@ -1932,7 +2070,7 @@ DT_INST_FOREACH_STATUS_OKAY(RUNTIME_PROCESSOR_INST)
         runtime_processor_setting_##n, RIP_SETTINGS_SUBSYSTEM_ID,                                  \
         DT_INST_PROP(n, processor_label), ZMK_CUSTOM_SETTING_VALUE_TYPE_BYTES,                     \
         RIP_SETTINGS_EMPTY_BYTES_DEFAULT, ZMK_CUSTOM_SETTING_CONFIDENTIALITY_RPC_PUBLIC,           \
-        ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE, ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,            \
+        ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE, ZMK_CUSTOM_SETTING_PERMISSION_SECURE,              \
         ZMK_CUSTOM_SETTING_NO_CONSTRAINT);
 
 DT_INST_FOREACH_STATUS_OKAY(RUNTIME_PROCESSOR_SETTINGS_INST)
@@ -2070,13 +2208,16 @@ static int discard_processor_settings_cb(const struct device *dev, void *user_da
     struct runtime_processor_data *data = dev->data;
     const struct runtime_processor_config *cfg = dev->config;
 
-    /* Serialize cancellation/reload with a worker that may already be running. */
+    /* I/O ordering is separate from short snapshot/configuration guards: the
+     * input worker never waits for a guard held across backend persistence. */
+    k_mutex_lock(&data->save_io_lock, K_FOREVER);
+    struct zmk_custom_setting_value value;
+    int ret = zmk_custom_setting_read_by_key(RIP_SETTINGS_SUBSYSTEM_ID, cfg->name, &value);
+    k_mutex_lock(&runtime_settings_guard, K_FOREVER);
     k_mutex_lock(&data->save_lock, K_FOREVER);
     k_work_cancel_delayable(&data->save_work);
     data->pending_save_valid = false;
 
-    struct zmk_custom_setting_value value;
-    int ret = zmk_custom_setting_read_by_key(RIP_SETTINGS_SUBSYSTEM_ID, cfg->name, &value);
     if (ret == 0 && value.type == ZMK_CUSTOM_SETTING_VALUE_TYPE_BYTES && value.size > 0 &&
         unpack_and_apply_processor_settings(data, value.bytes_value, value.size) == 0) {
         LOG_INF("Discarded unsaved changes for %s (reloaded from flash)", cfg->name);
@@ -2085,6 +2226,8 @@ static int discard_processor_settings_cb(const struct device *dev, void *user_da
         LOG_INF("Discarded unsaved changes for %s (no saved value, using defaults)", cfg->name);
     }
     k_mutex_unlock(&data->save_lock);
+    k_mutex_unlock(&runtime_settings_guard);
+    k_mutex_unlock(&data->save_io_lock);
     raise_state_changed_event(dev);
     return 0;
 }
@@ -2162,13 +2305,13 @@ static int reset_all_cb(const struct device *dev, void *user_data) {
     return zmk_input_processor_runtime_reset(dev);
 }
 
-int zmk_input_processor_runtime_reset_all(void) {
+static int zmk_input_processor_runtime_reset_all_locked(void) {
     LOG_INF("Resetting all processor settings to defaults");
     return zmk_input_processor_runtime_foreach(reset_all_cb, NULL);
 }
 
 // Event listener for keycode changes (for timestamp tracking)
-static int keycode_state_changed_listener(const zmk_event_t *eh) {
+static int keycode_state_changed_listener_locked(const zmk_event_t *eh) {
     struct zmk_keycode_state_changed *ev = as_zmk_keycode_state_changed(eh);
     if (ev == NULL) {
         return ZMK_EV_EVENT_BUBBLE;
@@ -2192,8 +2335,15 @@ static int keycode_state_changed_listener(const zmk_event_t *eh) {
     return ZMK_EV_EVENT_BUBBLE;
 }
 
+static int keycode_state_changed_listener(const zmk_event_t *eh) {
+    k_mutex_lock(&runtime_settings_guard, K_FOREVER);
+    int ret = keycode_state_changed_listener_locked(eh);
+    k_mutex_unlock(&runtime_settings_guard);
+    return ret;
+}
+
 // Event listener for position changes (for temp-layer deactivation logic)
-static int position_state_changed_listener(const zmk_event_t *eh) {
+static int position_state_changed_listener_locked(const zmk_event_t *eh) {
     const struct zmk_position_state_changed *ev = as_zmk_position_state_changed(eh);
     if (ev == NULL) {
         return ZMK_EV_EVENT_BUBBLE;
@@ -2339,13 +2489,20 @@ static int position_state_changed_listener(const zmk_event_t *eh) {
     return ZMK_EV_EVENT_BUBBLE;
 }
 
+static int position_state_changed_listener(const zmk_event_t *eh) {
+    k_mutex_lock(&runtime_settings_guard, K_FOREVER);
+    int ret = position_state_changed_listener_locked(eh);
+    k_mutex_unlock(&runtime_settings_guard);
+    return ret;
+}
+
 ZMK_LISTENER(runtime_processor_keycode_listener, keycode_state_changed_listener);
 ZMK_SUBSCRIPTION(runtime_processor_keycode_listener, zmk_keycode_state_changed);
 
 ZMK_LISTENER(runtime_processor_position_listener, position_state_changed_listener);
 ZMK_SUBSCRIPTION(runtime_processor_position_listener, zmk_position_state_changed);
 
-static int runtime_processor_layer_state_changed_listener(const zmk_event_t *eh) {
+static int runtime_processor_layer_state_changed_listener_locked(const zmk_event_t *eh) {
     const struct zmk_layer_state_changed *ev = as_zmk_layer_state_changed(eh);
     if (ev == NULL || ev->state) {
         return ZMK_EV_EVENT_BUBBLE;
@@ -2362,14 +2519,20 @@ static int runtime_processor_layer_state_changed_listener(const zmk_event_t *eh)
     return ZMK_EV_EVENT_BUBBLE;
 }
 
+static int runtime_processor_layer_state_changed_listener(const zmk_event_t *eh) {
+    k_mutex_lock(&runtime_settings_guard, K_FOREVER);
+    int ret = runtime_processor_layer_state_changed_listener_locked(eh);
+    k_mutex_unlock(&runtime_settings_guard);
+    return ret;
+}
+
 ZMK_LISTENER(runtime_processor_layer_listener, runtime_processor_layer_state_changed_listener);
 ZMK_SUBSCRIPTION(runtime_processor_layer_listener, zmk_layer_state_changed);
 
 // Temp-layer layer configuration API
-int zmk_input_processor_runtime_set_temp_layer(const struct device *dev, bool enabled,
-                                               uint32_t layer, uint32_t activation_delay_ms,
-                                               uint32_t deactivation_delay_ms,
-                                               enum zmk_input_processor_runtime_write_mode mode) {
+static int zmk_input_processor_runtime_set_temp_layer_locked(
+    const struct device *dev, bool enabled, uint32_t layer, uint32_t activation_delay_ms,
+    uint32_t deactivation_delay_ms, enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev || layer > UINT8_MAX || activation_delay_ms > UINT16_MAX ||
         deactivation_delay_ms > UINT16_MAX) {
         return -EINVAL;
@@ -2381,6 +2544,7 @@ int zmk_input_processor_runtime_set_temp_layer(const struct device *dev, bool en
     if (!enabled) {
         data->temp_layer_activation_pending = false;
         k_work_cancel_delayable(&data->temp_layer_activation_work);
+        k_work_reschedule(&data->temp_layer_deactivation_work, K_NO_WAIT);
     }
     data->temp_layer_layer = layer;
     data->temp_layer_activation_delay_ms = activation_delay_ms;
@@ -2400,7 +2564,7 @@ int zmk_input_processor_runtime_set_temp_layer(const struct device *dev, bool en
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_temp_layer_enabled(
+static int zmk_input_processor_runtime_set_temp_layer_enabled_locked(
     const struct device *dev, bool enabled, enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev) {
         return -EINVAL;
@@ -2411,6 +2575,7 @@ int zmk_input_processor_runtime_set_temp_layer_enabled(
     if (!enabled) {
         data->temp_layer_activation_pending = false;
         k_work_cancel_delayable(&data->temp_layer_activation_work);
+        k_work_reschedule(&data->temp_layer_deactivation_work, K_NO_WAIT);
     }
 
     if (mode != ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY) {
@@ -2422,7 +2587,7 @@ int zmk_input_processor_runtime_set_temp_layer_enabled(
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_temp_layer_layer(
+static int zmk_input_processor_runtime_set_temp_layer_layer_locked(
     const struct device *dev, uint32_t layer, enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev || layer > UINT8_MAX) {
         return -EINVAL;
@@ -2440,7 +2605,7 @@ int zmk_input_processor_runtime_set_temp_layer_layer(
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_temp_layer_activation_delay(
+static int zmk_input_processor_runtime_set_temp_layer_activation_delay_locked(
     const struct device *dev, uint32_t activation_delay_ms,
     enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev || activation_delay_ms > UINT16_MAX) {
@@ -2459,7 +2624,7 @@ int zmk_input_processor_runtime_set_temp_layer_activation_delay(
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_temp_layer_deactivation_delay(
+static int zmk_input_processor_runtime_set_temp_layer_deactivation_delay_locked(
     const struct device *dev, uint32_t deactivation_delay_ms,
     enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev || deactivation_delay_ms > UINT16_MAX) {
@@ -2478,7 +2643,7 @@ int zmk_input_processor_runtime_set_temp_layer_deactivation_delay(
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_active_layers(
+static int zmk_input_processor_runtime_set_active_layers_locked(
     const struct device *dev, uint32_t layers, enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev) {
         return -EINVAL;
@@ -2499,7 +2664,7 @@ int zmk_input_processor_runtime_set_active_layers(
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_axis_snap_mode(
+static int zmk_input_processor_runtime_set_axis_snap_mode_locked(
     const struct device *dev, uint32_t mode,
     enum zmk_input_processor_runtime_write_mode write_mode) {
     if (!dev) {
@@ -2515,6 +2680,7 @@ int zmk_input_processor_runtime_set_axis_snap_mode(
 
     // Reset snap state when mode changes
     data->axis_snap_cross_axis_accum = 0;
+    data->axis_snap_last_decay_timestamp = 0;
 
     if (write_mode != ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY) {
         data->persistent_axis_snap_mode = mode;
@@ -2525,7 +2691,7 @@ int zmk_input_processor_runtime_set_axis_snap_mode(
     return commit_write(dev, write_mode);
 }
 
-int zmk_input_processor_runtime_set_axis_snap_threshold(
+static int zmk_input_processor_runtime_set_axis_snap_threshold_locked(
     const struct device *dev, uint32_t threshold,
     enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev || threshold > UINT16_MAX) {
@@ -2534,6 +2700,8 @@ int zmk_input_processor_runtime_set_axis_snap_threshold(
 
     struct runtime_processor_data *data = dev->data;
     data->axis_snap_threshold = threshold;
+    data->axis_snap_cross_axis_accum = 0;
+    data->axis_snap_last_decay_timestamp = 0;
 
     if (mode != ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY) {
         data->persistent_axis_snap_threshold = threshold;
@@ -2544,7 +2712,7 @@ int zmk_input_processor_runtime_set_axis_snap_threshold(
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_axis_snap_timeout(
+static int zmk_input_processor_runtime_set_axis_snap_timeout_locked(
     const struct device *dev, uint32_t timeout_ms,
     enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev || timeout_ms > UINT16_MAX) {
@@ -2553,6 +2721,8 @@ int zmk_input_processor_runtime_set_axis_snap_timeout(
 
     struct runtime_processor_data *data = dev->data;
     data->axis_snap_timeout_ms = timeout_ms;
+    data->axis_snap_cross_axis_accum = 0;
+    data->axis_snap_last_decay_timestamp = 0;
 
     if (mode != ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY) {
         data->persistent_axis_snap_timeout_ms = timeout_ms;
@@ -2563,7 +2733,7 @@ int zmk_input_processor_runtime_set_axis_snap_timeout(
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_axis_snap(
+static int zmk_input_processor_runtime_set_axis_snap_locked(
     const struct device *dev, uint32_t mode, uint32_t threshold, uint32_t timeout_ms,
     enum zmk_input_processor_runtime_write_mode write_mode) {
     if (!dev || threshold > UINT16_MAX || timeout_ms > UINT16_MAX) {
@@ -2581,6 +2751,7 @@ int zmk_input_processor_runtime_set_axis_snap(
 
     // Reset snap state when configuration changes
     data->axis_snap_cross_axis_accum = 0;
+    data->axis_snap_last_decay_timestamp = 0;
 
     if (write_mode != ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY) {
         data->persistent_axis_snap_mode = mode;
@@ -2594,8 +2765,9 @@ int zmk_input_processor_runtime_set_axis_snap(
     return commit_write(dev, write_mode);
 }
 
-int zmk_input_processor_runtime_set_x_invert(const struct device *dev, bool invert,
-                                             enum zmk_input_processor_runtime_write_mode mode) {
+static int
+zmk_input_processor_runtime_set_x_invert_locked(const struct device *dev, bool invert,
+                                                enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev) {
         return -EINVAL;
     }
@@ -2612,8 +2784,9 @@ int zmk_input_processor_runtime_set_x_invert(const struct device *dev, bool inve
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_y_invert(const struct device *dev, bool invert,
-                                             enum zmk_input_processor_runtime_write_mode mode) {
+static int
+zmk_input_processor_runtime_set_y_invert_locked(const struct device *dev, bool invert,
+                                                enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev) {
         return -EINVAL;
     }
@@ -2630,7 +2803,7 @@ int zmk_input_processor_runtime_set_y_invert(const struct device *dev, bool inve
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_inertia_window(
+static int zmk_input_processor_runtime_set_inertia_window_locked(
     const struct device *dev, uint16_t window_ms,
     enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev) {
@@ -2652,7 +2825,7 @@ int zmk_input_processor_runtime_set_inertia_window(
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_inertia_interval(
+static int zmk_input_processor_runtime_set_inertia_interval_locked(
     const struct device *dev, uint16_t interval_ms,
     enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev) {
@@ -2674,7 +2847,7 @@ int zmk_input_processor_runtime_set_inertia_interval(
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_inertia_threshold(
+static int zmk_input_processor_runtime_set_inertia_threshold_locked(
     const struct device *dev, uint32_t threshold,
     enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev || threshold == 0) {
@@ -2693,7 +2866,7 @@ int zmk_input_processor_runtime_set_inertia_threshold(
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_inertia_decay(
+static int zmk_input_processor_runtime_set_inertia_decay_locked(
     const struct device *dev, uint8_t decay_percent,
     enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev || decay_percent > 100) {
@@ -2712,7 +2885,7 @@ int zmk_input_processor_runtime_set_inertia_decay(
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_inertia_normal_max_output(
+static int zmk_input_processor_runtime_set_inertia_normal_max_output_locked(
     const struct device *dev, uint16_t max_output,
     enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev || max_output > INT16_MAX) {
@@ -2727,10 +2900,13 @@ int zmk_input_processor_runtime_set_inertia_normal_max_output(
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_inertia_enabled(
+static int zmk_input_processor_runtime_set_inertia_enabled_locked(
     const struct device *dev, bool enabled, enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev) {
         return -EINVAL;
+    }
+    if (enabled && (!IS_ENABLED(CONFIG_ZMK_POINTING) || !IS_ENABLED(CONFIG_INPUT_MODE_THREAD))) {
+        return -ENOTSUP;
     }
     struct runtime_processor_data *data = dev->data;
     data->inertia_enabled = enabled;
@@ -2741,7 +2917,7 @@ int zmk_input_processor_runtime_set_inertia_enabled(
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_inertia_fast_threshold(
+static int zmk_input_processor_runtime_set_inertia_fast_threshold_locked(
     const struct device *dev, uint32_t threshold,
     enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev) {
@@ -2756,7 +2932,7 @@ int zmk_input_processor_runtime_set_inertia_fast_threshold(
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_inertia_fast_output_percent(
+static int zmk_input_processor_runtime_set_inertia_fast_output_percent_locked(
     const struct device *dev, uint16_t percent, enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev || percent < 100 || percent > 1000) {
         return -EINVAL;
@@ -2770,7 +2946,8 @@ int zmk_input_processor_runtime_set_inertia_fast_output_percent(
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_inertia_notifications(const struct device *dev, bool enabled) {
+static int zmk_input_processor_runtime_set_inertia_notifications_locked(const struct device *dev,
+                                                                        bool enabled) {
     if (!dev) {
         return -EINVAL;
     }
@@ -2787,8 +2964,8 @@ int zmk_input_processor_runtime_set_inertia_notifications(const struct device *d
     return 0;
 }
 
-void zmk_input_processor_runtime_temp_layer_keep_active(const struct device *dev,
-                                                        bool keep_active) {
+static void zmk_input_processor_runtime_temp_layer_keep_active_locked(const struct device *dev,
+                                                                      bool keep_active) {
     if (!dev) {
         return;
     }
@@ -2800,12 +2977,19 @@ void zmk_input_processor_runtime_temp_layer_keep_active(const struct device *dev
 
     // If releasing keep_active and layer is still active, deactivate
     // immediately
-    if (!keep_active && data->temp_layer_enabled && data->temp_layer_layer_active) {
+    if (!keep_active && data->temp_layer_layer_active) {
         k_work_reschedule(&data->temp_layer_deactivation_work, K_NO_WAIT);
     }
 }
 
-int zmk_input_processor_runtime_set_xy_to_scroll_enabled(
+void zmk_input_processor_runtime_temp_layer_keep_active(const struct device *dev,
+                                                        bool keep_active) {
+    k_mutex_lock(&runtime_settings_guard, K_FOREVER);
+    zmk_input_processor_runtime_temp_layer_keep_active_locked(dev, keep_active);
+    k_mutex_unlock(&runtime_settings_guard);
+}
+
+static int zmk_input_processor_runtime_set_xy_to_scroll_enabled_locked(
     const struct device *dev, bool enabled, enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev) {
         return -EINVAL;
@@ -2823,7 +3007,7 @@ int zmk_input_processor_runtime_set_xy_to_scroll_enabled(
     return commit_write(dev, mode);
 }
 
-int zmk_input_processor_runtime_set_xy_swap_enabled(
+static int zmk_input_processor_runtime_set_xy_swap_enabled_locked(
     const struct device *dev, bool enabled, enum zmk_input_processor_runtime_write_mode mode) {
     if (!dev) {
         return -EINVAL;
@@ -2840,3 +3024,162 @@ int zmk_input_processor_runtime_set_xy_swap_enabled(
 
     return commit_write(dev, mode);
 }
+
+/* Configuration operations use one guard with complete pipeline processing.
+ * Source input callbacks only enqueue frames; the dedicated pipeline worker
+ * takes this guard while processing, before any output is queued. */
+#define RIP_LOCKED_API(name, signature, arguments)                                                 \
+    int name signature {                                                                           \
+        k_mutex_lock(&runtime_settings_guard, K_FOREVER);                                          \
+        int ret = name##_locked arguments;                                                         \
+        k_mutex_unlock(&runtime_settings_guard);                                                   \
+        return ret;                                                                                \
+    }
+#define RIP_LOCKED_VOID_API(name, signature, arguments)                                            \
+    void name signature {                                                                          \
+        k_mutex_lock(&runtime_settings_guard, K_FOREVER);                                          \
+        name##_locked arguments;                                                                   \
+        k_mutex_unlock(&runtime_settings_guard);                                                   \
+    }
+RIP_LOCKED_API(zmk_input_processor_runtime_rotate_xy,
+               (const struct device *processor, int32_t x, int32_t y,
+                struct zmk_runtime_rotation_state *state, int16_t *rotated_x, int16_t *rotated_y),
+               (processor, x, y, state, rotated_x, rotated_y))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_scaling,
+               (const struct device *dev, uint32_t multiplier, uint32_t divisor,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, multiplier, divisor, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_rotation,
+               (const struct device *dev, int32_t degrees,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, degrees, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_reset, (const struct device *dev), (dev))
+
+RIP_LOCKED_VOID_API(zmk_input_processor_runtime_restore_persistent, (const struct device *dev),
+                    (dev))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_get_config,
+               (const struct device *dev, const char **name,
+                struct zmk_input_processor_runtime_config *config),
+               (dev, name, config))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_reset_all, (void), ())
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_temp_layer,
+               (const struct device *dev, bool enabled, uint32_t layer,
+                uint32_t activation_delay_ms, uint32_t deactivation_delay_ms,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, enabled, layer, activation_delay_ms, deactivation_delay_ms, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_temp_layer_enabled,
+               (const struct device *dev, bool enabled,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, enabled, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_temp_layer_layer,
+               (const struct device *dev, uint32_t layer,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, layer, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_temp_layer_activation_delay,
+               (const struct device *dev, uint32_t activation_delay_ms,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, activation_delay_ms, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_temp_layer_deactivation_delay,
+               (const struct device *dev, uint32_t deactivation_delay_ms,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, deactivation_delay_ms, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_active_layers,
+               (const struct device *dev, uint32_t layers,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, layers, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_axis_snap_mode,
+               (const struct device *dev, uint32_t mode,
+                enum zmk_input_processor_runtime_write_mode write_mode),
+               (dev, mode, write_mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_axis_snap_threshold,
+               (const struct device *dev, uint32_t threshold,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, threshold, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_axis_snap_timeout,
+               (const struct device *dev, uint32_t timeout_ms,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, timeout_ms, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_axis_snap,
+               (const struct device *dev, uint32_t mode, uint32_t threshold, uint32_t timeout_ms,
+                enum zmk_input_processor_runtime_write_mode write_mode),
+               (dev, mode, threshold, timeout_ms, write_mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_x_invert,
+               (const struct device *dev, bool invert,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, invert, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_y_invert,
+               (const struct device *dev, bool invert,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, invert, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_inertia_window,
+               (const struct device *dev, uint16_t window_ms,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, window_ms, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_inertia_interval,
+               (const struct device *dev, uint16_t interval_ms,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, interval_ms, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_inertia_threshold,
+               (const struct device *dev, uint32_t threshold,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, threshold, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_inertia_decay,
+               (const struct device *dev, uint8_t decay_percent,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, decay_percent, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_inertia_normal_max_output,
+               (const struct device *dev, uint16_t max_output,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, max_output, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_inertia_enabled,
+               (const struct device *dev, bool enabled,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, enabled, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_inertia_fast_threshold,
+               (const struct device *dev, uint32_t threshold,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, threshold, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_inertia_fast_output_percent,
+               (const struct device *dev, uint16_t percent,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, percent, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_inertia_notifications,
+               (const struct device *dev, bool enabled), (dev, enabled))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_xy_to_scroll_enabled,
+               (const struct device *dev, bool enabled,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, enabled, mode))
+
+RIP_LOCKED_API(zmk_input_processor_runtime_set_xy_swap_enabled,
+               (const struct device *dev, bool enabled,
+                enum zmk_input_processor_runtime_write_mode mode),
+               (dev, enabled, mode))
+#undef RIP_LOCKED_API
+#undef RIP_LOCKED_VOID_API

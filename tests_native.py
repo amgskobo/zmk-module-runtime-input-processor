@@ -66,6 +66,17 @@ def verify_native(output: Path, tests: Path):
                 (run / "events.log").write_text(filtered)
                 if filtered != (fixture / "keycode_events.snapshot").read_text():
                     raise AssertionError(f"{case}/{trial}: snapshot mismatch")
-                for marker in ("rip_persist_snapshot", "rip_rpc_widths_and_get_flags"):
+                for marker in (
+                    "rip_persist_snapshot",
+                    "rip_rpc_widths_and_get_flags",
+                    "rip_locked_reads_and_mutations",
+                    "rip_generic_blob_authorization",
+                    "rip_full_width_driver_boundaries",
+                    "rip_discard_retires_snap_state",
+                    "rip_rpc_write_mode_validation",
+                    "rip_snap_setting_retirement",
+                    "rip_invalid_snap_blob",
+                    "rip_disabled_temp_layer",
+                ):
                     if f"PASS: {marker}" not in result.stdout:
                         raise AssertionError(f"{case}/{trial}: missing {marker}")

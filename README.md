@@ -41,7 +41,7 @@ manifest:
     # Persistent settings storage backend used by this module
     - name: zmk-feature-custom-settings
       remote: amgskobo
-      revision: b91a8ceb0a57a0cf41b34270752d79463e2848fa
+      revision: c4071b095c3007d1deb055c609603ca9b5897d14
 ```
 
 ### 2. Enable the feature in your `config/<shield>.conf`
@@ -237,6 +237,13 @@ independent process starts, retaining each ordered log and the binary hash.
 4. Adjust scaling and rotation parameters
 5. Changes are applied immediately without restarting
 
+Studio permits List, Get and layer-info requests while locked. Every setting
+change, activity-notification toggle and Save/Discard/Reset operation requires an
+unlocked Studio session. If the optional generic Custom Settings RPC is enabled,
+the processor blobs remain readable while locked, but their writes and other
+mutations also require unlock. A generic blob write updates storage only; boot
+apply or this module's Discard All applies a valid stored blob to live settings.
+
 ### Storage modes (memory vs. persistent)
 
 Each setting write chooses where the value is stored, mirroring
@@ -264,6 +271,20 @@ The equivalent firmware API is
 and the setters take a `zmk_input_processor_runtime_write_mode`
 (`PERSIST` / `MEMORY` / `TEMPORARY`).
 
+Studio `Set*` requests accept only the declared write modes: `0` persists,
+`1` stages the baseline in memory, and `2` changes the live value temporarily.
+An omitted mode remains `0` for older clients. Unknown mode numbers return an
+error before changing processor state or scheduling a save.
+
+Configuration operations and complete runtime-pipeline frames share a recursive
+guard. A frame uses the values from one completed operation for both axes and
+every pipeline stage; a setting change waits for the current frame to finish.
+Source input callbacks continue to enqueue frames without taking that guard.
+Separate setter/RPC calls are independent operations, so a frame may see the
+intermediate configuration between two requests. Save All and Discard All visit
+processors individually. Persistence copies a captured snapshot under short
+state locks and performs backend I/O after releasing the frame guard.
+
 ### Configuration Parameters
 
 - **Scaling Multiplier/Divisor**: Controls pointer speed
@@ -274,6 +295,9 @@ and the setters take a `zmk_input_processor_runtime_write_mode`
     listener's signed 16-bit storage. Larger divisors are rejected before
     changing the live or saved configuration. Scaled output saturates to the
     signed 16-bit range.
+  - The full signed 32-bit input is retained through inversion and snapping,
+    including inversion of `INT32_MIN`, before scaling and signed 16-bit output
+    saturation. Fractional remainders use that full-width value.
 
 - **Inertia**: Starts continuous input after rapid same-direction movement
   - `inertia-enabled` enables the feature per processor (off by default;
@@ -308,6 +332,16 @@ and the setters take a `zmk_input_processor_runtime_write_mode`
     interval
   - Reports are distributed over elapsed time in Q16 rolling buckets. Inertia
     ends when its remaining tail cannot produce another scaled output count.
+  - Inertia output requires `CONFIG_INPUT_MODE_THREAD=y` with pointing enabled.
+    Each processor queues final-coordinate samples through a private input
+    device, so HID updates run on the same input thread as ordinary pointing
+    reports without applying source or downstream transforms again. Enabling
+    inertia at runtime without this support returns `-ENOTSUP`; a devicetree
+    configuration that enables inertia with synchronous pointing input fails
+    its build assertion.
+  - The producer never waits for a full input queue: an unavailable queue drops
+    that sample. A settings change or a new inertia run retires older queued
+    samples before they reach HID.
   - The Studio Web tuning area repeats in both directions and can lock either
     axis. Its optional activity display enables memory-only Studio RPC
     notifications for this processor, defaults to off, and changes the area
@@ -686,9 +720,100 @@ PERSIST followed by MEMORY before a debounce flush. A memory-only edit must
 not change the already captured durable snapshot. Gain/settings changes also
 retire fractional remainders independently for each source/axis.
 
+The Studio fixture enables locking and the generic settings RPC, and checks the
+actual core/custom dispatch and nanopb path: locked read requests, every locked
+mutation, unlocked mutation, and locked/unlocked persisted-blob writes. It also
+checks full-width inversion/snap on both axes and small-input snap retirement
+after saved/MEMORY/Discard All transitions. The portable numerical regression
+entry retains optimized and UBSan variants, including fractional-remainder
+controls. The additional generic-subsystem registration is an intentional
+snapshot expansion; existing output assertions remain unchanged.
+
+`src/test/rip_write_mode_cases.inc` retains omitted/known RPC modes and locked
+refusal through the same real dispatch and backend. Unknown values `3` and
+`123` must fail all 23 mode-bearing setters without changing configuration,
+input processing, registry bytes or backend write count. A refused request
+must also preserve an earlier accepted debounced save.
+
+The pipeline fixture pauses the real worker between X and Y while a setter
+thread attempts a change. It requires one coherent old frame, completion of the
+blocked setter, and one coherent new frame. It also records the executing HID
+thread while checking inertia's final coordinates on both pointer and scroll
+axes, two processors, stale queued samples, input-queue exhaustion and physical
+input recovery. Every pipeline repeat requires `rip_complete_frame_settings`
+and `rip_inertia_input_thread` in addition to the existing snapshot and markers.
+
+The Studio fixture checks snap accumulator retirement after both individual
+threshold/timeout setters, rejects saved snap modes `3` and `255` without
+changing live configuration, and disables an actual temporary layer while its
+keep key remains held. It exercises both the combined and individual layer
+setters. The numerical entry also covers both snap axes/signs and the positive
+enabled-layer keep-active case; its optimized and UBSan executions remain
+required.
+
+The Studio mock retains its original ten key transitions and their timing.
+Its final record reserves 250 ms before the exit-only callback: the selected
+core mock schedules with the current record's delay before advancing its index.
+This leaves the existing 100-iteration layer wait enough time to report a
+disabled-layer failure, including kernel tick rounding. An early mock exit
+without the required assertion diagnostic is not a detected negative control.
+
+To retain numerical evidence inside the prepared container, select a fresh
+absolute directory outside the owner source tree:
+
+```bash
+RIP_REVIEW_OUTPUT="$FRESH_OUTPUT" \
+  python3 -m unittest discover -s tests/review -p test_runtime_regressions.py -v
+```
+
+This keeps `review.c`, both binaries and their `.sha256` files, compiler commands
+and ordered logs, and per-scenario runtime logs in `results.json` and adjacent
+files even after an assertion fails. Existing paths, symlinks, relative paths
+and paths inside the owner are refused. Without this variable the temporary
+directory cleanup remains unchanged. The same 16 tests run each scenario once
+under optimized and UBSan flags; retaining output adds no repeat or rebuild.
+For a negative control, check the saved binary hash and replay that exact binary
+with the recorded scenario for the two additional fresh-process trials.
+
+The Studio review checks retain their conditions and error returns. A failed
+`REVIEW_REQUIRE` first flushes and switches the test logger to synchronous panic
+mode, then prints `FAIL: rip_review` with the fixture function, line and failed
+expression, including failures before the later state checks are reached.
+Missing success markers alone do not qualify as negative-control detection.
+Successful output and snapshots remain unchanged.
+
 The Web fixture retains edited gain/rotation when activity notifications arrive
-before or after an activity-toggle response. Review-branch pushes run Web
-checks/builds; Pages deployment is limited to `main`.
+before or after an activity-toggle response. It also retires a pending toggle
+after processor selection changes, including A to B to A and late successful,
+error and rejected responses. Review-branch pushes run Web checks/builds; Pages
+deployment is limited to `main`.
+
+For review negative controls, use a distinct, disposable owner staging directory
+inside the prepared Docker workspace. Invoke the unchanged helper from the
+read-only owner source; it refuses to modify its own checkout:
+
+```bash
+python3 "$OWNER_SOURCE/tests/review/apply_review_fault.py" "$FAULT" "$STAGED_OWNER"
+```
+
+Start each fault from the unmodified reviewed snapshot. Rebuild once per fault
+and run the same faulty native binary three times with fresh initial state.
+Require the designated behavioral assertion to fail in every trial; compilation,
+dependency, missing-marker and timeout failures do not establish detection.
+
+| Fault | Required detecting fixture |
+| --- | --- |
+| `frame-guard` | Pipeline: setter cannot complete while the old frame is paused |
+| `inertia-thread` | Pipeline: inertia and physical HID reports use one input thread |
+| `snap-threshold` | Numerical optimized/UBSan and Studio: prior accumulation is retired |
+| `snap-timeout` | Numerical optimized/UBSan and Studio: prior accumulation is retired |
+| `snap-blob` | Studio: invalid saved mode preserves valid configuration and axis output |
+| `keep-active` | Numerical optimized/UBSan and Studio: disabled held layer deactivates |
+| `activity-selection` | Web `ActivitySelection.spec.tsx`: retired responses do not alter the selected processor |
+
+Run the complete Web suite and its selected negative control in separate Jest
+processes. These controls supplement all existing scenarios, snapshots and
+numerical controls; they do not establish physical USB/BLE delivery or timing.
 
 If you want to execute west command manually, run below. (for zmk-build, the result is not verified.)
 

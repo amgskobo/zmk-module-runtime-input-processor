@@ -10,10 +10,13 @@ stand-ins. Inertia is disabled in these scenarios and is not exercised.
 """
 
 import hashlib
+import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -31,8 +34,15 @@ def declaration(text, kind, name):
 
 
 def function(text, name):
+    # Numeric controls use the unchanged arithmetic body behind the module's
+    # settings guard. The actual lock/frame interactions are kernel fixtures.
+    original_name = name
+    if re.search(r"\b" + re.escape(name) + r"_locked\(", text):
+        name += "_locked"
     match = re.search(
-        r"^(?:static )?[^\s;{}=][^\n;{}=]*\b" + re.escape(name) + r"\(", text, re.M
+        r"^(?:static )?[^\s;{}=][^\n;{}=]*(?:\n[ \t]*)?\b" + re.escape(name) + r"\(",
+        text,
+        re.M,
     )
     if match is None:
         raise ValueError("missing function: " + name)
@@ -51,10 +61,10 @@ def function(text, name):
             depth -= 1
             if depth == 0:
                 line = text.count("\n", 0, match.start()) + 1
-                return (
-                    f'#line {line} "{SOURCE}"\n'
-                    + text[match.start() : opening + token.end()]
-                )
+                body = text[match.start() : opening + token.end()]
+                if name != original_name:
+                    body = body.replace(name + "(", original_name + "(", 1)
+                return f'#line {line} "{SOURCE}"\n' + body
     raise ValueError("unterminated function: " + name)
 
 
@@ -108,6 +118,7 @@ static uint32_t active_layers;
 static struct k_work_delayable *k_work_delayable_from_work(struct k_work *work) { return CONTAINER_OF(work, struct k_work_delayable, work); }
 static int64_t k_uptime_get(void) { return now_ms; }
 static int k_work_reschedule(struct k_work_delayable *w, int64_t t) { (void)w; (void)t; return 0; }
+static int k_work_cancel_delayable(struct k_work_delayable *w) { (void)w; return 0; }
 static zmk_keymap_layer_id_t zmk_keymap_layer_index_to_id(int i) { return (uint8_t)i; }
 static bool zmk_keymap_layer_active(uint8_t i) { return (active_layers & (1U << i)) != 0; }
 static int zmk_keymap_layer_activate(uint8_t i, bool force) { (void)force; active_layers |= 1U << i; return 0; }
@@ -136,7 +147,45 @@ int main(int argc, char **argv) {
     setbuf(stdout, NULL);
     data.scale_multiplier = 1;
     data.scale_divisor = 1;
-    if (strcmp(argv[1], "scale-control") == 0) {
+    if (strcmp(argv[1], "invert-wide") == 0) {
+        const int32_t inputs[] = {INT32_MIN, INT32_MIN+1, -65536, -37, 0, 37, 65536, INT32_MAX};
+        const uint32_t divisors[] = {1, 32768};
+        for (unsigned axis=0; axis<2; axis++) {
+            data.x_invert=axis==0;
+            data.y_invert=axis==1;
+            for (unsigned d=0; d<ARRAY_SIZE(divisors); d++) {
+                data.scale_divisor=divisors[d];
+                int16_t remainder=0;
+                struct zmk_input_processor_state state={.remainder=&remainder};
+                for (unsigned i=0; i<ARRAY_SIZE(inputs); i++) {
+                    int64_t wide=-(int64_t)inputs[i];
+                    int64_t quotient=wide / divisors[d];
+                    int32_t expected=quotient>INT16_MAX?INT16_MAX:quotient<INT16_MIN?INT16_MIN:(int32_t)quotient;
+                    struct input_event event={INPUT_EV_REL,axis==0?INPUT_REL_X:INPUT_REL_Y,inputs[i],true,NULL};
+                    remainder=0;
+                    assert(runtime_processor_handle_event(&device,&event,0,0,&state)==0);
+                    printf("inverted axis=%u input=%d divisor=%u output=%d expected=%d remainder=%d\n",
+                           axis,inputs[i],divisors[d],event.value,expected,remainder);
+                    assert(event.value==expected);
+                    assert(remainder==wide % divisors[d]);
+                }
+            }
+        }
+    } else if (strcmp(argv[1], "snap-wide") == 0) {
+        const int32_t inputs[]={INT32_MIN,INT32_MAX,-65536,65536,-101,101};
+        for (uint32_t mode=1; mode<=2; mode++) {
+            for (unsigned i=0; i<ARRAY_SIZE(inputs); i++) {
+                assert(zmk_input_processor_runtime_set_axis_snap(&device,mode,100,1000,
+                    ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY)==0);
+                now_ms=1000;
+                int32_t expected=inputs[i]>INT16_MAX?INT16_MAX:inputs[i]<INT16_MIN?INT16_MIN:inputs[i];
+                assert(send(mode==1?INPUT_REL_Y:INPUT_REL_X,inputs[i],true)==expected);
+                /* A large event must not leave unbounded accumulated state. */
+                now_ms=3000;
+                assert(send(mode==1?INPUT_REL_Y:INPUT_REL_X,1,true)==0);
+            }
+        }
+    } else if (strcmp(argv[1], "scale-control") == 0) {
         assert(send(INPUT_REL_X, 37, true) == 37);
     } else if (strcmp(argv[1], "scale-product") == 0) {
         assert(zmk_input_processor_runtime_set_scaling(&device, 889, 500,
@@ -158,15 +207,15 @@ int main(int argc, char **argv) {
             remainder=0;
             for (unsigned i=0; i<32768; i++) {
                 struct input_event event = {INPUT_EV_REL, INPUT_REL_X, direction, true, NULL};
-                assert(scale_val(&event, 1, 32768, &state) == 0);
+                assert(scale_val(&event, event.value, 1, 32768, &state) == 0);
                 sum+=event.value;
             }
             assert(sum==direction && remainder==0);
         }
         struct input_event event = {INPUT_EV_REL, INPUT_REL_X, INT32_MAX, true, NULL};
-        assert(scale_val(&event, UINT32_MAX, 1, &state) == 0 && event.value == INT16_MAX);
+        assert(scale_val(&event, event.value, UINT32_MAX, 1, &state) == 0 && event.value == INT16_MAX);
         event.value=INT32_MIN;
-        assert(scale_val(&event, UINT32_MAX, 1, &state) == 0 && event.value == INT16_MIN);
+        assert(scale_val(&event, event.value, UINT32_MAX, 1, &state) == 0 && event.value == INT16_MIN);
     } else if (strcmp(argv[1], "snap-control") == 0 || strcmp(argv[1], "snap-short") == 0) {
         uint16_t timeout = strcmp(argv[1], "snap-short") == 0 ? 1 : 1000;
         assert(zmk_input_processor_runtime_set_axis_snap(&device,
@@ -281,6 +330,39 @@ int main(int argc, char **argv) {
         now_ms=3000; assert(send(INPUT_REL_X,1,true)==1);
         now_ms=3600; temp_layer_activation_work_handler(&data.temp_layer_activation_work.work);
         assert(!zmk_keymap_layer_active(1));
+    } else if (strcmp(argv[1], "snap-threshold-reset") == 0 ||
+               strcmp(argv[1], "snap-timeout-reset") == 0) {
+        for (uint32_t mode=1; mode<=2; mode++) {
+            for (int direction=-1; direction<=1; direction+=2) {
+                assert(zmk_input_processor_runtime_set_axis_snap(&device,mode,100,60000,
+                    ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY)==0);
+                now_ms=1000;
+                uint16_t code=mode==1?INPUT_REL_Y:INPUT_REL_X;
+                assert(send(code,direction*90,true)==0);
+                if (strcmp(argv[1], "snap-threshold-reset") == 0) {
+                    assert(zmk_input_processor_runtime_set_axis_snap_threshold(&device,150,
+                        ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY)==0);
+                } else {
+                    assert(zmk_input_processor_runtime_set_axis_snap_timeout(&device,59000,
+                        ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY)==0);
+                }
+                assert(send(code,direction*60,true)==0);
+            }
+        }
+    } else if (strcmp(argv[1], "disabled-keep-active") == 0) {
+        data.temp_layer_enabled=true;
+        data.temp_layer_layer_active=true;
+        data.temp_layer_active_layer=1;
+        data.temp_layer_keep_active=true;
+        active_layers=1U<<1;
+        temp_layer_deactivation_work_handler(&data.temp_layer_deactivation_work.work);
+        assert(zmk_keymap_layer_active(1));
+        assert(zmk_input_processor_runtime_set_temp_layer_enabled(&device,false,
+            ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY)==0);
+        temp_layer_deactivation_work_handler(&data.temp_layer_deactivation_work.work);
+        assert(!zmk_keymap_layer_active(1));
+        zmk_input_processor_runtime_temp_layer_keep_active(&device,false);
+        assert(!data.temp_layer_keep_active && !data.temp_layer_layer_active);
     } else { assert(!"unknown scenario"); }
     return 0;
 }
@@ -289,7 +371,70 @@ int main(int argc, char **argv) {
 
 class RuntimeReviewRegressions(unittest.TestCase):
     @classmethod
+    def write_retained_evidence(cls):
+        if cls.output is not None:
+            (cls.output / "results.json").write_text(
+                json.dumps(cls.evidence, indent=2) + "\n"
+            )
+
+    @classmethod
+    def finish_retained_evidence(cls):
+        if cls.output is None:
+            return
+        cls.evidence["input_hashes_after"] = {
+            path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            for path in cls.evidence["input_hashes"]
+        }
+        cls.evidence["source_unchanged"] = (
+            cls.evidence["input_hashes"] == cls.evidence["input_hashes_after"]
+        )
+        if any(
+            item.get("exit") != 0
+            for item in cls.evidence["compiles"] + cls.evidence["runs"]
+        ):
+            cls.evidence["status"] = "FAILED"
+        elif cls.evidence["status"] == "SETUP":
+            cls.evidence["status"] = "INCOMPLETE"
+        else:
+            cls.evidence["status"] = "FINISHED"
+        cls.write_retained_evidence()
+
+    @classmethod
     def setUpClass(cls):
+        cls.output = None
+        selected = os.environ.get("RIP_REVIEW_OUTPUT")
+        if selected is not None:
+            destination = Path(selected)
+            if (
+                not destination.is_absolute()
+                or destination.exists()
+                or destination.is_symlink()
+                or destination.resolve().is_relative_to(ROOT.resolve())
+            ):
+                raise ValueError(
+                    "RIP_REVIEW_OUTPUT must be a fresh absolute directory outside the owner"
+                )
+            destination.mkdir(parents=True, exist_ok=False)
+            cls.output = destination.resolve()
+            cls.evidence = {
+                "schema": 1,
+                "status": "SETUP",
+                "input_hashes": {
+                    str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in (
+                        SOURCE,
+                        ROOT / "include/zmk/pointing/input_processor_runtime.h",
+                        ROOT / "include/zmk/pointing/input_rotation.h",
+                        ROOT
+                        / "include/zmk/events/input_processor_inertia_state_changed.h",
+                        Path(__file__).resolve(),
+                    )
+                },
+                "compiles": [],
+                "runs": [],
+            }
+            cls.addClassCleanup(cls.finish_retained_evidence)
+            cls.write_retained_evidence()
         source = SOURCE.read_text()
         api = (ROOT / "include/zmk/pointing/input_processor_runtime.h").read_text()
         events = (
@@ -327,6 +472,10 @@ class RuntimeReviewRegressions(unittest.TestCase):
             "zmk_input_processor_runtime_set_scaling",
             "zmk_input_processor_runtime_set_temp_layer_layer",
             "zmk_input_processor_runtime_set_axis_snap",
+            "zmk_input_processor_runtime_set_axis_snap_threshold",
+            "zmk_input_processor_runtime_set_axis_snap_timeout",
+            "zmk_input_processor_runtime_set_temp_layer_enabled",
+            "zmk_input_processor_runtime_temp_layer_keep_active",
         )
         types += "\n" + declaration(
             (ROOT / "include/zmk/pointing/input_rotation.h").read_text(),
@@ -349,11 +498,20 @@ class RuntimeReviewRegressions(unittest.TestCase):
             + '\n#line 1 "review-scenarios.c"\n'
             + SCENARIOS
         )
-        cls.temp = tempfile.TemporaryDirectory(prefix="rip-review-")
-        cls.addClassCleanup(cls.temp.cleanup)
-        work = Path(cls.temp.name)
+        if cls.output is None:
+            cls.temp = tempfile.TemporaryDirectory(prefix="rip-review-")
+            cls.addClassCleanup(cls.temp.cleanup)
+            work = Path(cls.temp.name)
+        else:
+            work = cls.output
         cfile = work / "review.c"
         cfile.write_text(unit)
+        if cls.output is not None:
+            cls.evidence["generated_unit"] = {
+                "path": str(cfile),
+                "sha256": hashlib.sha256(cfile.read_bytes()).hexdigest(),
+            }
+            cls.write_retained_evidence()
         cls.binaries = []
         print(
             "Production source SHA256:",
@@ -382,18 +540,72 @@ class RuntimeReviewRegressions(unittest.TestCase):
                 "-o",
                 str(binary),
             ]
-            subprocess.run(command, check=True)
+            if cls.output is None:
+                subprocess.run(command, check=True)
+            else:
+                log = work / f"compile-{name}.log"
+                record = {
+                    "variant": name,
+                    "command": command,
+                    "cwd": str(Path.cwd()),
+                    "log": str(log),
+                    "started_ns": time.monotonic_ns(),
+                }
+                cls.evidence["compiles"].append(record)
+                cls.write_retained_evidence()
+                try:
+                    with log.open("w") as stream:
+                        result = subprocess.run(
+                            command, stdout=stream, stderr=subprocess.STDOUT
+                        )
+                    record["exit"] = result.returncode
+                    if binary.is_file():
+                        digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+                        record["binary"] = {"path": str(binary), "sha256": digest}
+                        (work / f"{name}.sha256").write_text(
+                            f"{digest}  {binary.name}\n"
+                        )
+                    if result.returncode:
+                        print(log.read_text(), flush=True)
+                    result.check_returncode()
+                finally:
+                    record["finished_ns"] = time.monotonic_ns()
+                    cls.write_retained_evidence()
             cls.binaries.append((name, binary))
+        if cls.output is not None:
+            cls.evidence["status"] = "RUNNING"
+            cls.write_retained_evidence()
 
     def run_scenario(self, scenario):
         for name, binary in self.binaries:
             with self.subTest(variant=name):
+                started_ns = time.monotonic_ns() if self.output is not None else None
                 result = subprocess.run(
                     [str(binary), scenario],
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                 )
+                if self.output is not None:
+                    log = self.output / f"run-{name}-{scenario}.log"
+                    log.write_text(result.stdout)
+                    self.evidence["runs"].append(
+                        {
+                            "variant": name,
+                            "scenario": scenario,
+                            "command": [str(binary), scenario],
+                            "cwd": str(Path.cwd()),
+                            "exit": result.returncode,
+                            "binary_sha256": hashlib.sha256(
+                                binary.read_bytes()
+                            ).hexdigest(),
+                            "log": str(log),
+                            "log_sha256": hashlib.sha256(log.read_bytes()).hexdigest(),
+                            "started_ns": started_ns,
+                            "finished_ns": time.monotonic_ns(),
+                        }
+                    )
+                    self.write_retained_evidence()
                 print(
                     f"{name}/{scenario}: exit={result.returncode}\n{result.stdout}",
                     flush=True,
@@ -402,6 +614,12 @@ class RuntimeReviewRegressions(unittest.TestCase):
 
     def test_gain_changes_retire_axis_remainders(self):
         self.run_scenario("settings-remainders")
+
+    def test_inversion_retains_full_width_and_fractional_remainders(self):
+        self.run_scenario("invert-wide")
+
+    def test_snap_uses_full_width_and_retires_bounded_accumulation(self):
+        self.run_scenario("snap-wide")
 
     def test_activation_waits_and_rejects_stale_input(self):
         self.run_scenario("activation-delay")
@@ -432,6 +650,15 @@ class RuntimeReviewRegressions(unittest.TestCase):
 
     def test_retarget_releases_previously_raised_layer(self):
         self.run_scenario("retarget-layer")
+
+    def test_threshold_change_retires_snap_accumulator(self):
+        self.run_scenario("snap-threshold-reset")
+
+    def test_timeout_change_retires_snap_accumulator(self):
+        self.run_scenario("snap-timeout-reset")
+
+    def test_disabling_temp_layer_overrides_keep_active(self):
+        self.run_scenario("disabled-keep-active")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@
 
 #include <zephyr/device.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 /* The listener stores signed 16-bit fractional remainders. */
 #define ZMK_INPUT_PROCESSOR_RUNTIME_MAX_SCALE_DIVISOR 32768U
@@ -439,7 +440,15 @@ int zmk_input_processor_runtime_set_inertia_normal_max_output(
 /** Enable or disable inertia transition notifications in RAM only. */
 int zmk_input_processor_runtime_set_inertia_notifications(const struct device *dev, bool enabled);
 
+#if IS_ENABLED(CONFIG_ZMK_RUNTIME_INPUT_PIPELINE_TEST)
+/* Queue one final-coordinate sample through the production inertia path. */
+int zmk_input_processor_runtime_test_queue_inertia(const struct device *dev, uint16_t code,
+                                                   int16_t value);
+#endif
+
 #if IS_ENABLED(CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_TEST)
+/* Expose the current serialized-field offset for an independent bad-record fixture. */
+size_t zmk_input_processor_runtime_test_snap_mode_offset(void);
 /** @brief Test-only: apply a v1 blob from main. */
 int zmk_input_processor_runtime_test_apply_legacy_v1(const struct device *dev);
 

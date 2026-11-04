@@ -149,7 +149,8 @@ static void send_inertia_state_notifications(struct k_work *work) {
             notification.notification_type.inertia_fast_input_changed.fast_input =
                 state.state == ZMK_INPUT_PROCESSOR_INERTIA_FAST_INPUT_STARTED;
         } else {
-            notification.which_notification_type = cormoran_rip_Notification_inertia_state_changed_tag;
+            notification.which_notification_type =
+                cormoran_rip_Notification_inertia_state_changed_tag;
             notification.notification_type.inertia_state_changed.id = id;
             notification.notification_type.inertia_state_changed.active =
                 state.state == ZMK_INPUT_PROCESSOR_INERTIA_STARTED;
@@ -185,8 +186,7 @@ static int input_processor_inertia_state_changed_listener(const zmk_event_t *eh)
 
 ZMK_LISTENER(input_processor_inertia_state_listener,
              input_processor_inertia_state_changed_listener);
-ZMK_SUBSCRIPTION(input_processor_inertia_state_listener,
-                 zmk_input_processor_inertia_state_changed);
+ZMK_SUBSCRIPTION(input_processor_inertia_state_listener, zmk_input_processor_inertia_state_changed);
 
 // NOTE: relay from peripheral is not required because all input-processors can
 // be defined in central side
